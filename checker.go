@@ -18,7 +18,8 @@ var blockedCountries = map[string]bool{
 
 // CheckProxies concurrently checks a list of proxies.
 // Filters out CN/HK IPs, tests Google connectivity.
-func CheckProxies(proxies []Proxy, timeout time.Duration, maxConcurrent int) []Proxy {
+// 传入 pool 实现实时添加节点
+func CheckProxies(proxies []Proxy, timeout time.Duration, maxConcurrent int, pool *ProxyPool) []Proxy {
 	var (
 		mu    sync.Mutex
 		alive []Proxy
@@ -45,6 +46,12 @@ func CheckProxies(proxies []Proxy, timeout time.Duration, maxConcurrent int) []P
 
 			if checkGoogle(px, timeout) {
 				log.Printf("[checker] %s OK (%s %s)", px.Addr(), px.Country, px.City)
+				
+				// 核心改动：测出一个立刻实时推送到全局代理池
+				if pool != nil {
+					pool.Add(px)
+				}
+
 				mu.Lock()
 				alive = append(alive, px)
 				mu.Unlock()
