@@ -17,6 +17,27 @@ func NewProxyPool() *ProxyPool {
 	return &ProxyPool{}
 }
 
+// Add 实时追加单个测活成功的节点（并发安全、自动去重）
+// 测出一个立即生效，无需等整批节点跑完
+func (p *ProxyPool) Add(px Proxy) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	// 避免重复添加
+	for _, existing := range p.proxies {
+		if existing.Addr() == px.Addr() {
+			return
+		}
+	}
+
+	p.proxies = append(p.proxies, px)
+	// 如果之前池子是空的，立即将当前活动节点指向第一个节点
+	if len(p.proxies) == 1 {
+		p.current = 0
+		log.Printf("[pool] 首个可用节点就绪: %s (%s %s)", px.Addr(), px.Country, px.City)
+	}
+}
+
 // Update replaces the proxy list with new verified proxies.
 // Resets current to 0 (pick the first one).
 func (p *ProxyPool) Update(proxies []Proxy) {
