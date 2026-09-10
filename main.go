@@ -79,7 +79,7 @@ func main() {
 	}()
 
 	// Start SOCKS5 server (blocks)
-	server := NewServer(cfg.ListenAddr, pool)
+	server := NewServer(cfg.ListenAddr, pool, cfg.AuthUser, cfg.AuthPass)
 	log.Fatal(server.Start())
 }
 

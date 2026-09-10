@@ -17,16 +17,21 @@ const (
 )
 
 type Server struct {
-	listenAddr string
-	pool       *ProxyPool
+    listenAddr string
+    pool       *ProxyPool
+    authUser   string
+    authPass   string
 }
 
-func NewServer(listenAddr string, pool *ProxyPool) *Server {
-	return &Server{
-		listenAddr: listenAddr,
-		pool:       pool,
-	}
+func NewServer(listenAddr string, pool *ProxyPool, authUser, authPass string) *Server {
+    return &Server{
+        listenAddr: listenAddr,
+        pool:       pool,
+        authUser:   authUser,
+        authPass:   authPass,
+    }
 }
+
 
 func (s *Server) Start() error {
 	ln, err := net.Listen("tcp", s.listenAddr)
@@ -46,20 +51,48 @@ func (s *Server) Start() error {
 }
 
 func (s *Server) handleConn(conn net.Conn) {
-	defer conn.Close()
+    defer conn.Close()
 
-	// 1. SOCKS5 handshake - read greeting
-	buf := make([]byte, 256)
-	n, err := conn.Read(buf)
-	if err != nil || n < 2 || buf[0] != socks5Version {
-		return
-	}
+    // 1. SOCKS5 握手阶段
+    buf := make([]byte, 512)
+    n, err := conn.Read(buf)
+    if err != nil || n < 2 || buf[0] != socks5Version {
+        return
+    }
 
-	// Reply: no auth required
-	conn.Write([]byte{socks5Version, 0x00})
+    // 如果配置了账号密码，强制要求用户名密码认证 (0x02)
+    if s.authUser != "" && s.authPass != "" {
+        conn.Write([]byte{socks5Version, 0x02})
 
-	// 2. Read connect request
-	n, err = conn.Read(buf)
+        // 读取客户端发送的认证信息 (RFC 1929)
+        n, err = conn.Read(buf)
+        if err != nil || n < 5 || buf[0] != 0x01 {
+            return
+        }
+        uLen := int(buf[1])
+        if n < 2+uLen+1 {
+            return
+        }
+        user := string(buf[2 : 2+uLen])
+        pLen := int(buf[2+uLen])
+        if n < 2+uLen+1+pLen {
+            return
+        }
+        pass := string(buf[3+uLen : 3+uLen+pLen])
+
+        // 校验账密
+        if user != s.authUser || pass != s.authPass {
+            conn.Write([]byte{0x01, 0x01}) // 认证失败，切断
+            return
+        }
+        conn.Write([]byte{0x01, 0x00}) // 认证成功，放行
+    } else {
+        // 未配置账密时免密通过
+        conn.Write([]byte{socks5Version, 0x00})
+    }
+
+    // 2. 读取连接请求
+    n, err = conn.Read(buf)
 	if err != nil || n < 7 || buf[1] != cmdConnect {
 		s.sendReply(conn, 0x07) // command not supported
 		return
