@@ -1,9 +1,12 @@
-name: Build Binary
+name: Build & Release
 
 on:
   push:
     branches: [ main, master ]
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -16,8 +19,9 @@ jobs:
       - name: Build
         run: |
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o socks5-pool .
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
         with:
-          name: socks5-pool-linux-amd64
-          path: socks5-pool
+          tag_name: latest
+          name: Latest Release
+          files: socks5-pool
