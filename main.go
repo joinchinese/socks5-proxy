@@ -31,8 +31,7 @@ func main() {
 
 	pool := NewProxyPool()
 
-	// 1. 【优先启动 Web 状态面板】
-	// 无论抓取多少个节点，确保 8080 端口在第 0.1 秒立即进入监听状态，彻底解决 Cloudflare 502
+	// 1. 【秒起 Web 状态面板】确保 8080 立即监听，避免 Cloudflare 502
 	go func() {
 		status := NewStatusServer(pool)
 		log.Printf("[status] dashboard at http://%s", cfg.StatusAddr)
@@ -41,8 +40,7 @@ func main() {
 		}
 	}()
 
-	// 2. 【后台进行初次抓取与定期测活】
-	// 避免初次测活 2000 多个节点时同步卡死主线程
+	// 2. 【后台进行抓取和测活】
 	go func() {
 		log.Printf("[main] 正在后台启动初始代理抓取与测活...")
 		refreshPool(cfg, pool)
@@ -65,8 +63,7 @@ func main() {
 		}
 	}()
 
-	// 3. 【后台代理轮换逻辑】
-	// 每 3-6 分钟自动随机切换当前使用的活动节点
+	// 3. 【后台自动轮换代理节点】
 	go func() {
 		for {
 			delay := 3*time.Minute + time.Duration(rand.Intn(4))*time.Minute
@@ -80,7 +77,7 @@ func main() {
 		}
 	}()
 
-	// 4. 【启动 SOCKS5 代理服务（阻塞主进程）】
+	// 4. 【启动 SOCKS5 服务】
 	server := NewServer(cfg.ListenAddr, pool, cfg.AuthUser, cfg.AuthPass)
 	log.Fatal(server.Start())
 }
@@ -92,7 +89,8 @@ func refreshPool(cfg *Config, pool *ProxyPool) {
 		return
 	}
 
-	alive := CheckProxies(proxies, cfg.CheckTimeout, cfg.MaxConcurrent)
+	// 注意这里：传入了第 4 个参数 pool，实现测出一个立即推入池中
+	alive := CheckProxies(proxies, cfg.CheckTimeout, cfg.MaxConcurrent, pool)
 	pool.Update(alive)
 
 	scrapeMu.Lock()
@@ -108,6 +106,6 @@ func TriggerRefresh() {
 	select {
 	case refreshChan <- struct{}{}:
 	default:
-		// 已经存在刷新请求在排队，直接忽略
+		// 已经有刷新任务在排队
 	}
 }
