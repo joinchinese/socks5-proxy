@@ -175,7 +175,7 @@ func (s *StatusServer) getStatusData() StatusData {
 
 	if s.pool.ruleManager != nil {
 		for _, r := range s.pool.ruleManager.All() {
-			cnt := s.pool.CountForCategory(r.Name)
+			cnt := s.pool.RealCountForCategory(r.Name)
 			activePx, ok := s.pool.GetActiveForCategory(r.Name)
 
 			var activeIP, location string
@@ -188,7 +188,7 @@ func (s *StatusServer) getStatusData() StatusData {
 					activeMap[activePx.Addr()] = r.Name
 				}
 			} else {
-				activeIP = "无就绪节点"
+				activeIP = "等待测活匹配..."
 				location = strings.Join(r.Domains, ",")
 			}
 
@@ -261,7 +261,9 @@ func (s *StatusServer) handleAddRule(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	s.pool.ruleManager.Add(req.Name, cleanDomains)
+	rule := s.pool.ruleManager.Add(req.Name, cleanDomains)
+	// 异步对当前存活节点快速测活新规则并即时打标
+	go s.pool.TestAndAddRuleToAlive(rule, 3*time.Second)
 	w.Write([]byte(`{"status":"ok"}`))
 }
 
@@ -281,6 +283,7 @@ func (s *StatusServer) handleDeleteRule(w http.ResponseWriter, r *http.Request) 
 	}
 
 	s.pool.ruleManager.Delete(req.Name)
+	s.pool.RemoveTagFromAllProxies(req.Name)
 	w.Write([]byte(`{"status":"ok"}`))
 }
 
@@ -557,6 +560,9 @@ function saveNewRule() {
     document.getElementById("new-rule-domains").value = "";
     toggleAddRule();
     loadStatus();
+    // 后台探测通常在 1~3 秒内完成，自动延时刷新展现新标签
+    setTimeout(loadStatus, 1500);
+    setTimeout(loadStatus, 3500);
   });
 }
 

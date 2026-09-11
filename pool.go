@@ -1,9 +1,15 @@
 package main
 
 import (
+	"crypto/tls"
+	"fmt"
 	"log"
+	"net"
+	"net/http"
+	"net/url"
 	"strings"
 	"sync"
+	"time"
 )
 
 type ProxyPool struct {
@@ -27,7 +33,6 @@ func (p *ProxyPool) Add(px Proxy) {
 
 	for i, existing := range p.proxies {
 		if existing.Addr() == px.Addr() {
-			// 更新已有节点的标签与城市
 			tagMap := make(map[string]bool)
 			for _, t := range existing.Tags {
 				tagMap[t] = true
@@ -56,7 +61,7 @@ func (p *ProxyPool) Add(px Proxy) {
 	}
 }
 
-// Update 批量覆盖节点列表（通常用于定时刷新完成）
+// Update 批量覆盖节点列表（全量测活完成时调用）
 func (p *ProxyPool) Update(proxies []Proxy) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -67,8 +72,8 @@ func (p *ProxyPool) Update(proxies []Proxy) {
 	}
 }
 
-// filterByCategory 根据分类标签筛选可用节点
-func (p *ProxyPool) filterByCategoryLocked(category string) []Proxy {
+// getMatchedLocked 仅获取真正具备该分类标签的节点
+func (p *ProxyPool) getMatchedLocked(category string) []Proxy {
 	if category == "Default" || category == "" {
 		return p.proxies
 	}
@@ -82,31 +87,29 @@ func (p *ProxyPool) filterByCategoryLocked(category string) []Proxy {
 			}
 		}
 	}
-
-	// 若专属分类暂无节点，降级返回全部节点
-	if len(matched) == 0 {
-		return p.proxies
-	}
 	return matched
 }
 
-// GetForCategory 获取指定分类当前激活的节点
+// GetForCategory 获取指定分类当前激活的节点，若该专属分类暂无节点则降级到 Default
 func (p *ProxyPool) GetForCategory(category string) (Proxy, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	list := p.filterByCategoryLocked(category)
-	if len(list) == 0 {
-		return Proxy{}, false
+	matched := p.getMatchedLocked(category)
+	if len(matched) == 0 {
+		matched = p.proxies
+		if len(matched) == 0 {
+			return Proxy{}, false
+		}
 	}
 
 	idx := p.currentIdx[category]
-	if idx >= len(list) {
+	if idx >= len(matched) {
 		idx = 0
 		p.currentIdx[category] = 0
 	}
 
-	return list[idx], true
+	return matched[idx], true
 }
 
 // SwitchNextForCategory 轮换指定分类的下一个节点
@@ -114,13 +117,16 @@ func (p *ProxyPool) SwitchNextForCategory(category string) (Proxy, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	list := p.filterByCategoryLocked(category)
-	if len(list) == 0 {
-		return Proxy{}, false
+	matched := p.getMatchedLocked(category)
+	if len(matched) == 0 {
+		matched = p.proxies
+		if len(matched) == 0 {
+			return Proxy{}, false
+		}
 	}
 
-	p.currentIdx[category] = (p.currentIdx[category] + 1) % len(list)
-	px := list[p.currentIdx[category]]
+	p.currentIdx[category] = (p.currentIdx[category] + 1) % len(matched)
+	px := matched[p.currentIdx[category]]
 	log.Printf("[pool] [%s] 切换至节点: %s (%s %s)", category, px.Addr(), px.Country, px.City)
 	return px, true
 }
@@ -130,18 +136,20 @@ func (p *ProxyPool) RemoveCurrentForCategory(category string) (Proxy, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	list := p.filterByCategoryLocked(category)
-	if len(list) == 0 {
-		return Proxy{}, false
+	matched := p.getMatchedLocked(category)
+	if len(matched) == 0 {
+		matched = p.proxies
+		if len(matched) == 0 {
+			return Proxy{}, false
+		}
 	}
 
 	idx := p.currentIdx[category]
-	if idx >= len(list) {
+	if idx >= len(matched) {
 		idx = 0
 	}
-	deadAddr := list[idx].Addr()
+	deadAddr := matched[idx].Addr()
 
-	// 从全局代理池中物理删除该失效节点
 	for i, px := range p.proxies {
 		if px.Addr() == deadAddr {
 			p.proxies = append(p.proxies[:i], p.proxies[i+1:]...)
@@ -150,17 +158,19 @@ func (p *ProxyPool) RemoveCurrentForCategory(category string) (Proxy, bool) {
 		}
 	}
 
-	// 重新获取列表
-	newList := p.filterByCategoryLocked(category)
-	if len(newList) == 0 {
-		p.currentIdx[category] = 0
-		return Proxy{}, false
+	newMatched := p.getMatchedLocked(category)
+	if len(newMatched) == 0 {
+		newMatched = p.proxies
+		if len(newMatched) == 0 {
+			p.currentIdx[category] = 0
+			return Proxy{}, false
+		}
 	}
 
-	if p.currentIdx[category] >= len(newList) {
+	if p.currentIdx[category] >= len(newMatched) {
 		p.currentIdx[category] = 0
 	}
-	return newList[p.currentIdx[category]], true
+	return newMatched[p.currentIdx[category]], true
 }
 
 // SwitchTo 手动将指定分类切换至特定 index
@@ -168,38 +178,157 @@ func (p *ProxyPool) SwitchTo(category string, index int) (Proxy, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	list := p.filterByCategoryLocked(category)
-	if index < 0 || index >= len(list) {
+	matched := p.getMatchedLocked(category)
+	if len(matched) == 0 {
+		matched = p.proxies
+	}
+	if index < 0 || index >= len(matched) {
 		return Proxy{}, false
 	}
 
 	p.currentIdx[category] = index
-	px := list[index]
+	px := matched[index]
 	log.Printf("[pool] [%s] 手动指定节点: %s", category, px.Addr())
 	return px, true
 }
 
-// GetActiveForCategory 获取当前分类正在服务的节点
+// GetActiveForCategory 仅获取真正具备该标签且当前激活的节点（用于 UI 状态展示，不乱降级）
 func (p *ProxyPool) GetActiveForCategory(category string) (Proxy, bool) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
-	list := p.filterByCategoryLocked(category)
-	if len(list) == 0 {
+	var matched []Proxy
+	if category == "Default" || category == "" {
+		matched = p.proxies
+	} else {
+		for _, px := range p.proxies {
+			for _, tag := range px.Tags {
+				if strings.EqualFold(tag, category) {
+					matched = append(matched, px)
+					break
+				}
+			}
+		}
+	}
+
+	if len(matched) == 0 {
 		return Proxy{}, false
 	}
+
 	idx := p.currentIdx[category]
-	if idx >= len(list) {
+	if idx >= len(matched) {
 		idx = 0
 	}
-	return list[idx], true
+	return matched[idx], true
 }
 
-// CountForCategory 获取指定分类的节点数量
-func (p *ProxyPool) CountForCategory(category string) int {
+// RealCountForCategory 获取指定分类真实具备该标签的节点数量
+func (p *ProxyPool) RealCountForCategory(category string) int {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	return len(p.filterByCategoryLocked(category))
+
+	if category == "Default" || category == "" {
+		return len(p.proxies)
+	}
+
+	count := 0
+	for _, px := range p.proxies {
+		for _, tag := range px.Tags {
+			if strings.EqualFold(tag, category) {
+				count++
+				break
+			}
+		}
+	}
+	return count
+}
+
+// TestAndAddRuleToAlive 动态添加规则时，后台对当前池内所有已存活节点快速测活并即时打标
+func (p *ProxyPool) TestAndAddRuleToAlive(rule RouteRule, timeout time.Duration) {
+	p.mu.RLock()
+	proxies := make([]Proxy, len(p.proxies))
+	copy(proxies, p.proxies)
+	p.mu.RUnlock()
+
+	if len(proxies) == 0 {
+		return
+	}
+
+	log.Printf("[pool] 正在为当前 %d 个存活节点快速探测新规则 [%s]...", len(proxies), rule.Name)
+
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 15)
+
+	for _, px := range proxies {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(pItem Proxy) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			proxyURL, err := url.Parse(fmt.Sprintf("socks5://%s", pItem.Addr()))
+			if err != nil {
+				return
+			}
+			transport := &http.Transport{
+				Proxy: http.ProxyURL(proxyURL),
+				TLSClientConfig: &tls.Config{
+					InsecureSkipVerify: false,
+				},
+				DialContext: (&net.Dialer{
+					Timeout: timeout,
+				}).DialContext,
+				ResponseHeaderTimeout: timeout,
+				DisableKeepAlives:     true,
+			}
+			client := &http.Client{
+				Transport: transport,
+				Timeout:   timeout,
+			}
+
+			if testSingleRule(client, rule, timeout) {
+				p.AddTagToProxy(pItem.Addr(), rule.Name)
+				log.Printf("[pool] 节点 %s 验证通过新规则 [%s]，已自动打标", pItem.Addr(), rule.Name)
+			}
+		}(px)
+	}
+
+	wg.Wait()
+	log.Printf("[pool] 新规则 [%s] 探测就绪，匹配到可用节点数: %d", rule.Name, p.RealCountForCategory(rule.Name))
+}
+
+// AddTagToProxy 为指定地址的节点动态添加标签（去重）
+func (p *ProxyPool) AddTagToProxy(addr string, tag string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	for i, px := range p.proxies {
+		if px.Addr() == addr {
+			for _, t := range px.Tags {
+				if strings.EqualFold(t, tag) {
+					return
+				}
+			}
+			p.proxies[i].Tags = append(p.proxies[i].Tags, tag)
+			return
+		}
+	}
+}
+
+// RemoveTagFromAllProxies 当规则被删除时，从所有节点中清理该标签
+func (p *ProxyPool) RemoveTagFromAllProxies(tag string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	for i, px := range p.proxies {
+		var newTags []string
+		for _, t := range px.Tags {
+			if !strings.EqualFold(t, tag) {
+				newTags = append(newTags, t)
+			}
+		}
+		p.proxies[i].Tags = newTags
+	}
 }
 
 func (p *ProxyPool) Size() int {
