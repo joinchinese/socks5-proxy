@@ -56,7 +56,6 @@ func NewStatusServer(pool *ProxyPool, adminPass, listenCfg string) *StatusServer
 		publicIP:  "127.0.0.1",
 	}
 
-	// 异步自动探测当前服务器公网 IP
 	go s.detectPublicIP()
 	return s
 }
@@ -103,7 +102,6 @@ func (s *StatusServer) checkAuth(r *http.Request) bool {
 		return true
 	}
 
-	// 优先检查 Header: Authorization: Bearer <pass>
 	authHeader := r.Header.Get("Authorization")
 	if strings.HasPrefix(authHeader, "Bearer ") {
 		token := strings.TrimPrefix(authHeader, "Bearer ")
@@ -112,12 +110,10 @@ func (s *StatusServer) checkAuth(r *http.Request) bool {
 		}
 	}
 
-	// 检查 Cookie
 	if cookie, err := r.Cookie("admin_token"); err == nil && cookie.Value == s.adminPass {
 		return true
 	}
 
-	// 检查 Query 参数
 	if r.URL.Query().Get("token") == s.adminPass {
 		return true
 	}
@@ -174,9 +170,8 @@ func (s *StatusServer) getStatusData() StatusData {
 		nextStr = next.In(beijingLoc).Format("2006-01-02 15:04:05")
 	}
 
-	// 获取各规则的 Active 出口信息
 	var outbounds []RuleOutboundStatus
-	activeMap := make(map[string]string) // addr -> active rule names
+	activeMap := make(map[string]string)
 
 	if s.pool.ruleManager != nil {
 		for _, r := range s.pool.ruleManager.All() {
@@ -340,14 +335,12 @@ var dashboardTmpl = template.Must(template.New("dashboard").Parse(`<!DOCTYPE htm
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:system-ui,-apple-system,sans-serif;background:#0f172a;color:#e2e8f0;padding:12px}
 .container{max-width:900px;margin:0 auto}
-.card{background:#1e293b;border-radius:8px;padding:12px 16px;margin:8px 0;border:1px solid #334155}
 .btn{background:#38bdf8;color:#0f172a;border:none;padding:6px 14px;border-radius:6px;cursor:pointer;font-weight:bold;font-size:0.8rem}
 .btn:hover{background:#7dd3fc}
 .btn-sm{padding:2px 8px;font-size:0.75rem;border-radius:4px;cursor:pointer}
 .btn-outline{background:transparent;border:1px solid #64748b;color:#94a3b8}
 .btn-outline:hover{background:#334155;color:#fff}
 .input-text{background:#0f172a;border:1px solid #475569;border-radius:6px;color:#fff;padding:6px 10px;font-size:0.85rem}
-.badge{padding:2px 6px;border-radius:4px;font-size:0.75rem;font-weight:bold}
 .tag{background:#334155;color:#94a3b8;font-size:0.75rem;padding:2px 6px;border-radius:4px}
 .tag-active{background:rgba(74,222,128,0.2);color:#4ade80;border:1px solid #4ade80}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin:10px 0}
@@ -395,7 +388,6 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#0f172a;color:#e2
       </div>
     </div>
 
-    <!-- 内联添加规则表单 -->
     <div id="add-rule-form" style="display:none;background:#1e293b;border:1px solid #38bdf8;border-radius:8px;padding:12px;margin:10px 0">
       <div style="font-size:0.85rem;color:#38bdf8;font-weight:bold;margin-bottom:8px">添加自定义分流规则</div>
       <div style="display:flex;gap:8px;flex-wrap:wrap">
@@ -418,21 +410,21 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#0f172a;color:#e2
 </div>
 
 <script>
-let token = localStorage.getItem("admin_token") || "";
-let cachedData = null;
-let currentTab = "all";
+var token = localStorage.getItem("admin_token") || "";
+var cachedData = null;
+var currentTab = "all";
 
 function getHeaders() {
   return { "Authorization": "Bearer " + token, "Content-Type": "application/json" };
 }
 
 function login() {
-  const p = document.getElementById("pwd-input").value;
+  var p = document.getElementById("pwd-input").value;
   fetch("/api/auth", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ password: p })
-  }).then(res => {
+  }).then(function(res) {
     if (res.ok) {
       token = p;
       localStorage.setItem("admin_token", token);
@@ -442,7 +434,7 @@ function login() {
     } else {
       document.getElementById("login-err").style.display = "block";
     }
-  }).catch(() => {
+  }).catch(function() {
     document.getElementById("login-err").style.display = "block";
   });
 }
@@ -455,17 +447,17 @@ function logout() {
 }
 
 function copyEndpoint() {
-  const text = document.getElementById("pub-endpoint").textContent;
-  navigator.clipboard.writeText(text).then(() => { alert("已复制接入点: " + text); });
+  var text = document.getElementById("pub-endpoint").textContent;
+  navigator.clipboard.writeText(text).then(function() { alert("已复制接入点: " + text); });
 }
 
 function loadStatus() {
   fetch("/api/status", { headers: getHeaders() })
-    .then(r => {
-      if (r.status === 401) { logout(); return; }
+    .then(function(r) {
+      if (r.status === 401) { logout(); return null; }
       return r.json();
     })
-    .then(data => {
+    .then(function(data) {
       if (!data) return;
       cachedData = data;
       renderAll();
@@ -476,48 +468,69 @@ function renderAll() {
   if (!cachedData) return;
   document.getElementById("pub-endpoint").textContent = cachedData.public_endpoint;
 
-  // 渲染规则卡片
-  const rBox = document.getElementById("rules-container");
-  rBox.innerHTML = (cachedData.active_outbounds || []).map(r => `
-    <div class="rule-card">
-      <button class="del-btn" onclick="delRule('${r.name}')" title="删除规则">×</button>
-      <div style="font-size:0.85rem;font-weight:bold;color:#38bdf8">${r.name} <span style="font-size:0.75rem;color:#94a3b8">(${r.count})</span></div>
-      <div style="font-family:monospace;font-size:0.8rem;color:#4ade80;margin:4px 0">${r.active_ip}</div>
-      <div style="font-size:0.75rem;color:#94a3b8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${r.location}">${r.location}</div>
-    </div>
-  `).join("");
+  var rBox = document.getElementById("rules-container");
+  var outbounds = cachedData.active_outbounds || [];
+  var rulesHtml = "";
+  for (var i = 0; i < outbounds.length; i++) {
+    var r = outbounds[i];
+    rulesHtml += '<div class="rule-card">' +
+      '<button class="del-btn" onclick="delRule(\'' + r.name + '\')" title="删除规则">&times;</button>' +
+      '<div style="font-size:0.85rem;font-weight:bold;color:#38bdf8">' + r.name + ' <span style="font-size:0.75rem;color:#94a3b8">(' + r.count + ')</span></div>' +
+      '<div style="font-family:monospace;font-size:0.8rem;color:#4ade80;margin:4px 0">' + r.active_ip + '</div>' +
+      '<div style="font-size:0.75rem;color:#94a3b8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="' + r.location + '">' + r.location + '</div>' +
+      '</div>';
+  }
+  rBox.innerHTML = rulesHtml;
 
-  // 渲染 Tabs
-  const tBox = document.getElementById("tabs-container");
-  let tabsHtml = `<button class="tab-btn ${currentTab==='all'?'active':''}" onclick="setTab('all')">全部 (${cachedData.total})</button>`;
-  (cachedData.active_outbounds || []).forEach(r => {
-    tabsHtml += `<button class="tab-btn ${currentTab===r.name?'active':''}" onclick="setTab('${r.name}')">${r.name} (${r.count})</button>`;
-  });
+  var tBox = document.getElementById("tabs-container");
+  var tabsHtml = '<button class="tab-btn ' + (currentTab === "all" ? "active" : "") + '" onclick="setTab(\'all\')">全部 (' + cachedData.total + ')</button>';
+  for (var j = 0; j < outbounds.length; j++) {
+    var ob = outbounds[j];
+    tabsHtml += '<button class="tab-btn ' + (currentTab === ob.name ? "active" : "") + '" onclick="setTab(\'' + ob.name + '\')">' + ob.name + ' (' + ob.count + ')</button>';
+  }
   tBox.innerHTML = tabsHtml;
 
-  // 渲染节点列表
-  const pBox = document.getElementById("proxies-container");
-  const filtered = (cachedData.proxies || []).filter(p => currentTab === 'all' || (p.tags && p.tags.includes(currentTab)));
-  
+  var pBox = document.getElementById("proxies-container");
+  var allProxies = cachedData.proxies || [];
+  var filtered = [];
+  for (var k = 0; k < allProxies.length; k++) {
+    var px = allProxies[k];
+    if (currentTab === "all") {
+      filtered.push(px);
+    } else if (px.tags && px.tags.indexOf(currentTab) !== -1) {
+      filtered.push(px);
+    }
+  }
+
   if (filtered.length === 0) {
-    pBox.innerHTML = `<div style="text-align:center;padding:30px;color:#64748b">暂无满足该条件的节点</div>`;
+    pBox.innerHTML = '<div style="text-align:center;padding:30px;color:#64748b">暂无满足该条件的节点</div>';
     return;
   }
 
-  pBox.innerHTML = filtered.map(p => `
-    <div class="proxy-item">
-      <div>
-        <div style="display:flex;align-items:center;gap:6px">
-          <span style="font-family:monospace;font-size:0.85rem;font-weight:bold">${p.addr}</span>
-          ${p.active ? `<span class="tag tag-active">ACTIVE: ${p.active}</span>` : '<span class="tag">STANDBY</span>'}
-        </div>
-        <div style="font-size:0.75rem;color:#94a3b8;margin-top:2px">${p.country} · ${p.city}</div>
-      </div>
-      <div style="display:flex;gap:4px;flex-wrap:wrap">
-        ${(p.tags || []).map(t => `<span class="tag">${t}</span>`).join("")}
-      </div>
-    </div>
-  `).join("");
+  var proxiesHtml = "";
+  for (var m = 0; m < filtered.length; m++) {
+    var p = filtered[m];
+    var activeSpan = p.active ? '<span class="tag tag-active">ACTIVE: ' + p.active + '</span>' : '<span class="tag">STANDBY</span>';
+    var tagsSpan = "";
+    if (p.tags) {
+      for (var n = 0; n < p.tags.length; n++) {
+        tagsSpan += '<span class="tag">' + p.tags[n] + '</span>';
+      }
+    }
+    proxiesHtml += '<div class="proxy-item">' +
+      '<div>' +
+      '<div style="display:flex;align-items:center;gap:6px">' +
+      '<span style="font-family:monospace;font-size:0.85rem;font-weight:bold">' + p.addr + '</span>' +
+      activeSpan +
+      '</div>' +
+      '<div style="font-size:0.75rem;color:#94a3b8;margin-top:2px">' + p.country + ' · ' + p.city + '</div>' +
+      '</div>' +
+      '<div style="display:flex;gap:4px;flex-wrap:wrap">' +
+      tagsSpan +
+      '</div>' +
+      '</div>';
+  }
+  pBox.innerHTML = proxiesHtml;
 }
 
 function setTab(t) {
@@ -526,20 +539,20 @@ function setTab(t) {
 }
 
 function toggleAddRule() {
-  const f = document.getElementById("add-rule-form");
+  var f = document.getElementById("add-rule-form");
   f.style.display = f.style.display === "none" ? "block" : "none";
 }
 
 function saveNewRule() {
-  const name = document.getElementById("new-rule-name").value.trim();
-  const domains = document.getElementById("new-rule-domains").value.trim();
+  var name = document.getElementById("new-rule-name").value.trim();
+  var domains = document.getElementById("new-rule-domains").value.trim();
   if (!name || !domains) { alert("请填写名称和域名"); return; }
 
   fetch("/api/rules/add", {
     method: "POST",
     headers: getHeaders(),
     body: JSON.stringify({ name: name, domains: domains })
-  }).then(r => r.json()).then(() => {
+  }).then(function(r) { return r.json(); }).then(function() {
     document.getElementById("new-rule-name").value = "";
     document.getElementById("new-rule-domains").value = "";
     toggleAddRule();
@@ -553,7 +566,7 @@ function delRule(name) {
     method: "POST",
     headers: getHeaders(),
     body: JSON.stringify({ name: name })
-  }).then(r => r.json()).then(() => {
+  }).then(function(r) { return r.json(); }).then(function() {
     if (currentTab === name) currentTab = "all";
     loadStatus();
   });
@@ -561,10 +574,9 @@ function delRule(name) {
 
 function refreshPool() {
   fetch("/api/refresh", { method: "POST", headers: getHeaders() })
-    .then(() => { alert("已触发重新抓取测活！"); });
+    .then(function() { alert("已触发重新抓取测活！"); });
 }
 
-// 自动检测登录态
 if (token) {
   document.getElementById("login-box").style.display = "none";
   document.getElementById("main-panel").style.display = "block";
