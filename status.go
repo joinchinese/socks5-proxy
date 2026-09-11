@@ -591,6 +591,7 @@ function renderAll() {
   var tabsHtml = '<button class="tab-btn ' + (currentTab === "all" ? "active" : "") + '" onclick="setTab(\'all\')">全部 (' + cachedData.total + ')</button>';
   for (var j = 0; j < outbounds.length; j++) {
     var ob = outbounds[j];
+    if (ob.name === "Default") continue; // 排除 Default 标签，因为与“全部”完全重合
     tabsHtml += '<button class="tab-btn ' + (currentTab === ob.name ? "active" : "") + '" onclick="setTab(\'' + ob.name + '\')">' + ob.name + ' (' + ob.count + ')</button>';
   }
   tBox.innerHTML = tabsHtml;
