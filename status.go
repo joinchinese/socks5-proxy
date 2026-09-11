@@ -174,6 +174,28 @@ func (s *StatusServer) getStatusData() StatusData {
 	var outbounds []RuleOutboundStatus
 	activeMap := make(map[string]string)
 
+	// 1. 获取 Default（通用兜底池）当前激活出口并高亮
+	defaultPx, hasDef := s.pool.GetActiveForCategory("Default")
+	var defIP, defLoc string
+	if hasDef {
+		defIP = defaultPx.Addr()
+		defLoc = fmt.Sprintf("%s · %s", defaultPx.Country, defaultPx.City)
+		activeMap[defaultPx.Addr()] = "Default"
+	} else {
+		defIP = "无就绪节点"
+		defLoc = "未匹配规则的全部流量"
+	}
+
+	outbounds = append(outbounds, RuleOutboundStatus{
+		ID:       "rule_default",
+		Name:     "Default",
+		Domains:  "* (通用兜底)",
+		ActiveIP: defIP,
+		Location: defLoc,
+		Count:    len(proxies),
+	})
+
+	// 2. 获取业务规则激活出口
 	if s.pool.ruleManager != nil {
 		for _, r := range s.pool.ruleManager.All() {
 			cnt := s.pool.RealCountForCategory(r.Name)
@@ -538,18 +560,26 @@ function renderAll() {
   var rulesHtml = "";
   for (var i = 0; i < outbounds.length; i++) {
     var r = outbounds[i];
-    rulesHtml += '<div class="rule-card">' +
-      '<div class="card-actions">' +
-      '<button class="action-btn" onclick="openEditRuleBtn(this)" data-name="' + r.name + '" data-domains="' + r.domains + '" title="编辑规则">&#9998;</button>' +
-      '<button class="action-btn del" onclick="askDeleteRule(\'' + r.name + '\', event)" title="删除规则">&times;</button>' +
-      '</div>' +
-      '<div id="del-pop-' + r.name + '" class="del-popover" style="display:none">' +
-      '<div style="font-size:0.75rem;color:#fca5a5;margin-bottom:6px">确认删除规则 ' + r.name + '？</div>' +
-      '<div style="display:flex;gap:6px;justify-content:flex-end">' +
-      '<button class="btn-sm" style="background:#ef4444;color:#fff;border:none" onclick="confirmDelete(\'' + r.name + '\')">确认</button>' +
-      '<button class="btn-sm btn-outline" onclick="closeDelPop(\'' + r.name + '\')">取消</button>' +
-      '</div>' +
-      '</div>' +
+    var isDefault = (r.name === "Default");
+    var actionsHtml = "";
+    if (!isDefault) {
+      actionsHtml = '<div class="card-actions">' +
+        '<button class="action-btn" onclick="openEditRuleBtn(this)" data-name="' + r.name + '" data-domains="' + r.domains + '" title="编辑规则">&#9998;</button>' +
+        '<button class="action-btn del" onclick="askDeleteRule(\'' + r.name + '\', event)" title="删除规则">&times;</button>' +
+        '</div>' +
+        '<div id="del-pop-' + r.name + '" class="del-popover" style="display:none">' +
+        '<div style="font-size:0.75rem;color:#fca5a5;margin-bottom:6px">确认删除规则 ' + r.name + '？</div>' +
+        '<div style="display:flex;gap:6px;justify-content:flex-end">' +
+        '<button class="btn-sm" style="background:#ef4444;color:#fff;border:none" onclick="confirmDelete(\'' + r.name + '\')">确认</button>' +
+        '<button class="btn-sm btn-outline" onclick="closeDelPop(\'' + r.name + '\')">取消</button>' +
+        '</div>' +
+        '</div>';
+    } else {
+      actionsHtml = '<div class="card-actions" style="font-size:0.7rem;color:#64748b;padding-right:2px">系统兜底</div>';
+    }
+
+    rulesHtml += '<div class="rule-card" style="' + (isDefault ? 'border-color:#38bdf8;' : '') + '">' +
+      actionsHtml +
       '<div style="font-size:0.85rem;font-weight:bold;color:#38bdf8;padding-right:42px">' + r.name + ' <span style="font-size:0.75rem;color:#94a3b8">(' + r.count + ')</span></div>' +
       '<div style="font-family:monospace;font-size:0.8rem;color:#4ade80;margin:4px 0">' + r.active_ip + '</div>' +
       '<div style="font-size:0.75rem;color:#94a3b8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="' + r.domains + '">' + r.location + '</div>' +
