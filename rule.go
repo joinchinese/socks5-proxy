@@ -115,7 +115,23 @@ func (rm *RuleManager) Add(name string, domains []string) RouteRule {
 	return rule
 }
 
-func (rm *RuleManager) Update(oldName, newName string, domains []string) (RouteRule, bool) {
+func sameDomains(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	seen := make(map[string]bool)
+	for _, v := range a {
+		seen[strings.ToLower(strings.TrimSpace(v))] = true
+	}
+	for _, v := range b {
+		if !seen[strings.ToLower(strings.TrimSpace(v))] {
+			return false
+		}
+	}
+	return true
+}
+
+func (rm *RuleManager) Update(oldName, newName string, domains []string) (RouteRule, bool, bool) {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
 
@@ -123,15 +139,16 @@ func (rm *RuleManager) Update(oldName, newName string, domains []string) (RouteR
 	newName = strings.TrimSpace(newName)
 	for i, r := range rm.rules {
 		if strings.EqualFold(r.Name, oldName) {
+			domainsChanged := !sameDomains(rm.rules[i].Domains, domains)
 			rm.rules[i].Name = newName
 			rm.rules[i].Domains = domains
 			rm.rules[i].ID = "rule_" + strings.ToLower(newName)
 			rm.saveLocked()
-			log.Printf("[rule] 更新规则: %s -> %s %v", oldName, newName, domains)
-			return rm.rules[i], true
+			log.Printf("[rule] 更新规则: %s -> %s %v (域名变动: %v)", oldName, newName, domains, domainsChanged)
+			return rm.rules[i], domainsChanged, true
 		}
 	}
-	return RouteRule{}, false
+	return RouteRule{}, false, false
 }
 
 func (rm *RuleManager) Delete(name string) bool {

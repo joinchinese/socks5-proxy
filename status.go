@@ -295,18 +295,22 @@ func (s *StatusServer) handleUpdateRule(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	rule, ok := s.pool.ruleManager.Update(req.OldName, req.Name, cleanDomains)
+	rule, domainsChanged, ok := s.pool.ruleManager.Update(req.OldName, req.Name, cleanDomains)
 	if !ok {
 		w.WriteHeader(http.StatusNotFound)
 		w.Write([]byte(`{"error":"rule not found"}`))
 		return
 	}
 
+	// 若修改了规则名称，同步在内存中替换已有节点的标签，无网络开销
 	if !strings.EqualFold(req.OldName, req.Name) {
 		s.pool.RenameTag(req.OldName, req.Name)
 	}
 
-	go s.pool.TestAndAddRuleToAlive(rule, 3*time.Second)
+	// 仅当域名实际发生增删变动时，才发起网络轻量测活；仅改名则跳过探测
+	if domainsChanged {
+		go s.pool.TestAndAddRuleToAlive(rule, 3*time.Second)
+	}
 	w.Write([]byte(`{"status":"ok"}`))
 }
 
