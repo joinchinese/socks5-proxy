@@ -29,24 +29,26 @@ func main() {
 	log.Printf("  source:   %s", cfg.ScrapeURL)
 	log.Printf("  scrape:   every %s", cfg.ScrapeInterval)
 
-	pool := NewProxyPool()
+	// 初始化分流规则管理器（持久化到当前目录 rules.json）
+	rm := NewRuleManager("rules.json")
+	pool := NewProxyPool(rm)
 
-	// 1. 【秒起 Web 状态面板】确保 8080 立即监听，避免 Cloudflare 502
+	// 1. 【优先秒起 Web 状态面板】确保 8080 端口第 0.1 秒立即进入监听，彻底告别 502
 	go func() {
-		status := NewStatusServer(pool)
+		status := NewStatusServer(pool, cfg.AdminPass, cfg.ListenAddr)
 		log.Printf("[status] dashboard at http://%s", cfg.StatusAddr)
 		if err := status.Start(cfg.StatusAddr); err != nil {
 			log.Printf("[status] failed to start: %v", err)
 		}
 	}()
 
-	// 2. 【后台进行抓取和测活】
+	// 2. 【后台进行初次抓取与测活】
 	go func() {
 		log.Printf("[main] 正在后台启动初始代理抓取与测活...")
 		refreshPool(cfg, pool)
 
 		if pool.Size() == 0 {
-			log.Printf("[warn] no alive proxies found, will retry on next scrape cycle")
+			log.Printf("[warn] 初始未发现可用节点，将在下一个抓取周期重试")
 		}
 
 		ticker := time.NewTicker(cfg.ScrapeInterval)
@@ -56,28 +58,34 @@ func main() {
 			case <-ticker.C:
 				refreshPool(cfg, pool)
 			case <-refreshChan:
-				log.Printf("[main] manual refresh triggered")
+				log.Printf("[main] 手动刷新触发...")
 				refreshPool(cfg, pool)
 				ticker.Reset(cfg.ScrapeInterval)
 			}
 		}
 	}()
 
-	// 3. 【后台自动轮换代理节点】
+	// 3. 【后台自动随机轮换代理节点 (每 3~6 分钟)】
 	go func() {
 		for {
 			delay := 3*time.Minute + time.Duration(rand.Intn(4))*time.Minute
 			time.Sleep(delay)
 			if pool.Size() == 0 {
-				log.Printf("[main] pool empty, triggering immediate refresh")
+				log.Printf("[main] 代理池为空，触发紧急刷新")
 				TriggerRefresh()
-			} else if pool.Size() > 1 {
-				pool.SwitchNext()
+			} else {
+				// 对每个规则分类顺延切换下一个可用节点
+				if pool.ruleManager != nil {
+					for _, r := range pool.ruleManager.All() {
+						pool.SwitchNextForCategory(r.Name)
+					}
+				}
+				pool.SwitchNextForCategory("Default")
 			}
 		}
 	}()
 
-	// 4. 【启动 SOCKS5 服务】
+	// 4. 【启动 SOCKS5 单端口智能分流服务（阻塞主进程）】
 	server := NewServer(cfg.ListenAddr, pool, cfg.AuthUser, cfg.AuthPass)
 	log.Fatal(server.Start())
 }
@@ -85,11 +93,10 @@ func main() {
 func refreshPool(cfg *Config, pool *ProxyPool) {
 	proxies, err := Scrape(cfg.ScrapeURL)
 	if err != nil {
-		log.Printf("[error] scrape failed: %v", err)
+		log.Printf("[error] 抓取代理源失败: %v", err)
 		return
 	}
 
-	// 注意这里：传入了第 4 个参数 pool，实现测出一个立即推入池中
 	alive := CheckProxies(proxies, cfg.CheckTimeout, cfg.MaxConcurrent, pool)
 	pool.Update(alive)
 
@@ -98,7 +105,7 @@ func refreshPool(cfg *Config, pool *ProxyPool) {
 	nextScrapeTime = lastScrapeTime.Add(cfg.ScrapeInterval)
 	scrapeMu.Unlock()
 
-	log.Printf("[main] pool refreshed: %d alive proxies", pool.Size())
+	log.Printf("[main] 代理池刷新就绪: 共 %d 个合格代理", pool.Size())
 }
 
 // TriggerRefresh 发送手动刷新信号 (非阻塞)
@@ -106,6 +113,5 @@ func TriggerRefresh() {
 	select {
 	case refreshChan <- struct{}{}:
 	default:
-		// 已经有刷新任务在排队
 	}
 }

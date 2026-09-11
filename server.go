@@ -17,33 +17,32 @@ const (
 )
 
 type Server struct {
-    listenAddr string
-    pool       *ProxyPool
-    authUser   string
-    authPass   string
+	listenAddr string
+	pool       *ProxyPool
+	authUser   string
+	authPass   string
 }
 
 func NewServer(listenAddr string, pool *ProxyPool, authUser, authPass string) *Server {
-    return &Server{
-        listenAddr: listenAddr,
-        pool:       pool,
-        authUser:   authUser,
-        authPass:   authPass,
-    }
+	return &Server{
+		listenAddr: listenAddr,
+		pool:       pool,
+		authUser:   authUser,
+		authPass:   authPass,
+	}
 }
-
 
 func (s *Server) Start() error {
 	ln, err := net.Listen("tcp", s.listenAddr)
 	if err != nil {
 		return fmt.Errorf("listen failed: %w", err)
 	}
-	log.Printf("[server] SOCKS5 proxy listening on %s", s.listenAddr)
+	log.Printf("[server] SOCKS5 代理已启动并在 %s 监听 (单端口智能分流)", s.listenAddr)
 
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			log.Printf("[server] accept error: %v", err)
+			log.Printf("[server] accept 异常: %v", err)
 			continue
 		}
 		go s.handleConn(conn)
@@ -51,97 +50,103 @@ func (s *Server) Start() error {
 }
 
 func (s *Server) handleConn(conn net.Conn) {
-    defer conn.Close()
+	defer conn.Close()
 
-    // 1. SOCKS5 握手阶段
-    buf := make([]byte, 512)
-    n, err := conn.Read(buf)
-    if err != nil || n < 2 || buf[0] != socks5Version {
-        return
-    }
-
-    // 如果配置了账号密码，强制要求用户名密码认证 (0x02)
-    if s.authUser != "" && s.authPass != "" {
-        conn.Write([]byte{socks5Version, 0x02})
-
-        // 读取客户端发送的认证信息 (RFC 1929)
-        n, err = conn.Read(buf)
-        if err != nil || n < 5 || buf[0] != 0x01 {
-            return
-        }
-        uLen := int(buf[1])
-        if n < 2+uLen+1 {
-            return
-        }
-        user := string(buf[2 : 2+uLen])
-        pLen := int(buf[2+uLen])
-        if n < 2+uLen+1+pLen {
-            return
-        }
-        pass := string(buf[3+uLen : 3+uLen+pLen])
-
-        // 校验账密
-        if user != s.authUser || pass != s.authPass {
-            conn.Write([]byte{0x01, 0x01}) // 认证失败，切断
-            return
-        }
-        conn.Write([]byte{0x01, 0x00}) // 认证成功，放行
-    } else {
-        // 未配置账密时免密通过
-        conn.Write([]byte{socks5Version, 0x00})
-    }
-
-    // 2. 读取连接请求
-    n, err = conn.Read(buf)
-	if err != nil || n < 7 || buf[1] != cmdConnect {
-		s.sendReply(conn, 0x07) // command not supported
+	// 1. SOCKS5 握手认证阶段
+	buf := make([]byte, 512)
+	n, err := conn.Read(buf)
+	if err != nil || n < 2 || buf[0] != socks5Version {
 		return
 	}
 
-	// Parse target address
+	if s.authUser != "" && s.authPass != "" {
+		conn.Write([]byte{socks5Version, 0x02})
+
+		n, err = conn.Read(buf)
+		if err != nil || n < 5 || buf[0] != 0x01 {
+			return
+		}
+		uLen := int(buf[1])
+		if n < 2+uLen+1 {
+			return
+		}
+		user := string(buf[2 : 2+uLen])
+		pLen := int(buf[2+uLen])
+		if n < 2+uLen+1+pLen {
+			return
+		}
+		pass := string(buf[3+uLen : 3+uLen+pLen])
+
+		if user != s.authUser || pass != s.authPass {
+			conn.Write([]byte{0x01, 0x01})
+			return
+		}
+		conn.Write([]byte{0x01, 0x00})
+	} else {
+		conn.Write([]byte{socks5Version, 0x00})
+	}
+
+	// 2. 读取目标请求
+	n, err = conn.Read(buf)
+	if err != nil || n < 7 || buf[1] != cmdConnect {
+		s.sendReply(conn, 0x07)
+		return
+	}
+
 	targetAddr, err := parseTarget(buf[:n])
 	if err != nil {
-		s.sendReply(conn, 0x04) // host unreachable
+		s.sendReply(conn, 0x04)
 		return
 	}
 
-	// 3. Use current proxy, switch on failure
+	// 3. 提取目标 Host 并进行智能域名规则分流
+	host, _, err := net.SplitHostPort(targetAddr)
+	if err != nil {
+		host = targetAddr
+	}
+
+	category := "Default"
+	if s.pool != nil && s.pool.ruleManager != nil {
+		category = s.pool.ruleManager.Match(host)
+	}
+
+	// 4. 从匹配的分类专属池中获取节点并转发（失败时自动重试与剔除）
 	maxRetries := 3
 	for i := 0; i < maxRetries; i++ {
 		var upstream Proxy
 		var ok bool
 		if i == 0 {
-			upstream, ok = s.pool.Current()
+			upstream, ok = s.pool.GetForCategory(category)
 		} else {
-			upstream, ok = s.pool.SwitchNext()
+			// 重试时顺延切换下一个
+			upstream, ok = s.pool.SwitchNextForCategory(category)
 		}
 		if !ok {
-			log.Printf("[server] no proxies available")
-			s.sendReply(conn, 0x01) // general failure
+			log.Printf("[server] [%s] 分流池无可用节点", category)
+			s.sendReply(conn, 0x01)
 			return
 		}
 
 		remote, err := dialViaSOCKS5(upstream, targetAddr, 10*time.Second)
 		if err != nil {
-			log.Printf("[server] upstream %s failed: %v, switching...", upstream.Addr(), err)
+			log.Printf("[server] [%s] 节点 %s 连通失败 (%v)，剔除并切换下一个...", category, upstream.Addr(), err)
+			s.pool.RemoveCurrentForCategory(category)
 			continue
 		}
 
-		// Success
+		// 转发成功
 		s.sendReply(conn, 0x00)
 		relay(conn, remote)
 		return
 	}
 
-	s.sendReply(conn, 0x01) // general failure after retries
+	s.sendReply(conn, 0x01)
 }
 
 func (s *Server) sendReply(conn net.Conn, status byte) {
-	// Minimal SOCKS5 reply: ver, status, rsv, atyp(ipv4), addr(0.0.0.0), port(0)
 	conn.Write([]byte{socks5Version, status, 0x00, atypIPv4, 0, 0, 0, 0, 0, 0})
 }
 
-// parseTarget extracts the target address from a SOCKS5 connect request.
 func parseTarget(buf []byte) (string, error) {
 	if len(buf) < 7 {
 		return "", fmt.Errorf("request too short")
@@ -179,7 +184,6 @@ func parseTarget(buf []byte) (string, error) {
 	return fmt.Sprintf("%s:%d", host, port), nil
 }
 
-// dialViaSOCKS5 connects to target through an upstream SOCKS5 proxy.
 func dialViaSOCKS5(upstream Proxy, target string, timeout time.Duration) (net.Conn, error) {
 	conn, err := net.DialTimeout("tcp", upstream.Addr(), timeout)
 	if err != nil {
@@ -187,7 +191,6 @@ func dialViaSOCKS5(upstream Proxy, target string, timeout time.Duration) (net.Co
 	}
 	conn.SetDeadline(time.Now().Add(timeout))
 
-	// SOCKS5 greeting
 	conn.Write([]byte{0x05, 0x01, 0x00})
 	buf := make([]byte, 2)
 	if _, err := io.ReadFull(conn, buf); err != nil {
@@ -199,7 +202,6 @@ func dialViaSOCKS5(upstream Proxy, target string, timeout time.Duration) (net.Co
 		return nil, fmt.Errorf("not socks5")
 	}
 
-	// Parse target host:port
 	host, portStr, err := net.SplitHostPort(target)
 	if err != nil {
 		conn.Close()
@@ -208,10 +210,7 @@ func dialViaSOCKS5(upstream Proxy, target string, timeout time.Duration) (net.Co
 	port := 0
 	fmt.Sscanf(portStr, "%d", &port)
 
-	// Build connect request
 	req := []byte{0x05, 0x01, 0x00}
-
-	// Check if host is an IP
 	if ip := net.ParseIP(host); ip != nil {
 		if ip4 := ip.To4(); ip4 != nil {
 			req = append(req, atypIPv4)
@@ -221,7 +220,6 @@ func dialViaSOCKS5(upstream Proxy, target string, timeout time.Duration) (net.Co
 			req = append(req, ip...)
 		}
 	} else {
-		// Domain name
 		req = append(req, atypDomain, byte(len(host)))
 		req = append(req, []byte(host)...)
 	}
@@ -229,7 +227,6 @@ func dialViaSOCKS5(upstream Proxy, target string, timeout time.Duration) (net.Co
 
 	conn.Write(req)
 
-	// Read reply
 	resp := make([]byte, 256)
 	n, err := conn.Read(resp)
 	if err != nil || n < 2 || resp[1] != 0x00 {
@@ -240,12 +237,10 @@ func dialViaSOCKS5(upstream Proxy, target string, timeout time.Duration) (net.Co
 		return nil, fmt.Errorf("upstream connect failed, status: %d", resp[1])
 	}
 
-	// Clear deadline for relay
 	conn.SetDeadline(time.Time{})
 	return conn, nil
 }
 
-// relay copies data bidirectionally between two connections.
 func relay(left, right net.Conn) {
 	defer left.Close()
 	defer right.Close()
@@ -253,7 +248,6 @@ func relay(left, right net.Conn) {
 	done := make(chan struct{}, 2)
 	cp := func(dst, src net.Conn) {
 		io.Copy(dst, src)
-		// Try half-close if supported
 		if tc, ok := dst.(*net.TCPConn); ok {
 			tc.CloseWrite()
 		}

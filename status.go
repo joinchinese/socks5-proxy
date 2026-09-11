@@ -2,55 +2,170 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"html/template"
+	"io"
+	"log"
+	"net"
 	"net/http"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 )
 
 type StatusServer struct {
-	pool *ProxyPool
+	pool      *ProxyPool
+	adminPass string
+	listenCfg string
+	publicIP  string
+	ipMu      sync.RWMutex
 }
 
 type StatusData struct {
-	Total        int           `json:"total"`
-	ActiveProxy  string        `json:"active_proxy"`
-	ActiveRegion string        `json:"active_region"`
-	LastScrape   string        `json:"last_scrape"`
-	NextScrape   string        `json:"next_scrape"`
-	Proxies      []ProxyStatus `json:"proxies"`
+	Total           int                  `json:"total"`
+	PublicEndpoint  string               `json:"public_endpoint"`
+	LastScrape      string               `json:"last_scrape"`
+	NextScrape      string               `json:"next_scrape"`
+	ActiveOutbounds []RuleOutboundStatus `json:"active_outbounds"`
+	Proxies         []ProxyStatus        `json:"proxies"`
+}
+
+type RuleOutboundStatus struct {
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Domains  string `json:"domains"`
+	ActiveIP string `json:"active_ip"`
+	Location string `json:"location"`
+	Count    int    `json:"count"`
 }
 
 type ProxyStatus struct {
-	Addr    string `json:"addr"`
-	Country string `json:"country"`
-	City    string `json:"city"`
-	Active  bool   `json:"active"`
+	Addr    string   `json:"addr"`
+	Country string   `json:"country"`
+	City    string   `json:"city"`
+	Tags    []string `json:"tags"`
+	Active  string   `json:"active"` // 当前为哪个规则激活
 }
 
-func NewStatusServer(pool *ProxyPool) *StatusServer {
-	return &StatusServer{
-		pool: pool,
+func NewStatusServer(pool *ProxyPool, adminPass, listenCfg string) *StatusServer {
+	s := &StatusServer{
+		pool:      pool,
+		adminPass: adminPass,
+		listenCfg: listenCfg,
+		publicIP:  "127.0.0.1",
 	}
+
+	// 异步自动探测当前服务器公网 IP
+	go s.detectPublicIP()
+	return s
+}
+
+func (s *StatusServer) detectPublicIP() {
+	endpoints := []string{
+		"https://api.ipify.org",
+		"https://icanhazip.com",
+		"https://ifconfig.me/ip",
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	for _, ep := range endpoints {
+		resp, err := client.Get(ep)
+		if err == nil && resp.StatusCode == http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			ip := strings.TrimSpace(string(body))
+			if net.ParseIP(ip) != nil {
+				s.ipMu.Lock()
+				s.publicIP = ip
+				s.ipMu.Unlock()
+				log.Printf("[status] 自动获取到服务器公网 IP: %s", ip)
+				return
+			}
+		}
+	}
+}
+
+func (s *StatusServer) getPublicEndpoint() string {
+	s.ipMu.RLock()
+	ip := s.publicIP
+	s.ipMu.RUnlock()
+
+	_, port, err := net.SplitHostPort(s.listenCfg)
+	if err != nil {
+		port = "1080"
+	}
+	return fmt.Sprintf("%s:%s", ip, port)
+}
+
+func (s *StatusServer) checkAuth(r *http.Request) bool {
+	if s.adminPass == "" {
+		return true
+	}
+
+	// 优先检查 Header: Authorization: Bearer <pass>
+	authHeader := r.Header.Get("Authorization")
+	if strings.HasPrefix(authHeader, "Bearer ") {
+		token := strings.TrimPrefix(authHeader, "Bearer ")
+		if token == s.adminPass {
+			return true
+		}
+	}
+
+	// 检查 Cookie
+	if cookie, err := r.Cookie("admin_token"); err == nil && cookie.Value == s.adminPass {
+		return true
+	}
+
+	// 检查 Query 参数
+	if r.URL.Query().Get("token") == s.adminPass {
+		return true
+	}
+
+	return false
 }
 
 func (s *StatusServer) Start(addr string) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleDashboard)
+	mux.HandleFunc("/api/auth", s.handleAuth)
 	mux.HandleFunc("/api/status", s.handleAPI)
 	mux.HandleFunc("/api/refresh", s.handleRefresh)
 	mux.HandleFunc("/api/switch", s.handleSwitch)
+	mux.HandleFunc("/api/rules/add", s.handleAddRule)
+	mux.HandleFunc("/api/rules/delete", s.handleDeleteRule)
 	return http.ListenAndServe(addr, mux)
+}
+
+func (s *StatusServer) handleAuth(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	if s.adminPass != "" && req.Password != s.adminPass {
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"error":"invalid password"}`))
+		return
+	}
+
+	w.Write([]byte(`{"status":"ok"}`))
 }
 
 func (s *StatusServer) getStatusData() StatusData {
 	proxies := s.pool.All()
-	activeIdx := s.pool.CurrentIndex()
 	last, next := getScrapeTimes()
 
-	// Beijing timezone (UTC+8)
 	beijingLoc := time.FixedZone("CST", 8*3600)
-
 	var lastStr, nextStr string
 	if !last.IsZero() {
 		lastStr = last.In(beijingLoc).Format("2006-01-02 15:04:05")
@@ -59,186 +174,402 @@ func (s *StatusServer) getStatusData() StatusData {
 		nextStr = next.In(beijingLoc).Format("2006-01-02 15:04:05")
 	}
 
+	// 获取各规则的 Active 出口信息
+	var outbounds []RuleOutboundStatus
+	activeMap := make(map[string]string) // addr -> active rule names
+
+	if s.pool.ruleManager != nil {
+		for _, r := range s.pool.ruleManager.All() {
+			cnt := s.pool.CountForCategory(r.Name)
+			activePx, ok := s.pool.GetActiveForCategory(r.Name)
+
+			var activeIP, location string
+			if ok {
+				activeIP = activePx.Addr()
+				location = fmt.Sprintf("%s · %s", activePx.Country, activePx.City)
+				if existing, exists := activeMap[activePx.Addr()]; exists {
+					activeMap[activePx.Addr()] = existing + ", " + r.Name
+				} else {
+					activeMap[activePx.Addr()] = r.Name
+				}
+			} else {
+				activeIP = "无就绪节点"
+				location = strings.Join(r.Domains, ",")
+			}
+
+			outbounds = append(outbounds, RuleOutboundStatus{
+				ID:       r.ID,
+				Name:     r.Name,
+				Domains:  strings.Join(r.Domains, ", "),
+				ActiveIP: activeIP,
+				Location: location,
+				Count:    cnt,
+			})
+		}
+	}
+
 	var ps []ProxyStatus
-	for i, p := range proxies {
+	for _, p := range proxies {
+		act := activeMap[p.Addr()]
 		ps = append(ps, ProxyStatus{
 			Addr:    p.Addr(),
 			Country: p.Country,
 			City:    p.City,
-			Active:  i == activeIdx,
+			Tags:    p.Tags,
+			Active:  act,
 		})
 	}
 
-	// Get active proxy info
-	var activeProxy, activeRegion string
-	if p, ok := s.pool.Current(); ok {
-		activeProxy = p.Addr()
-		activeRegion = p.Country
-		if p.City != "" {
-			activeRegion += ", " + p.City
-		}
-	} else {
-		activeProxy = "None"
-		activeRegion = "-"
-	}
-
 	return StatusData{
-		Total:        len(proxies),
-		ActiveProxy:  activeProxy,
-		ActiveRegion: activeRegion,
-		LastScrape:   lastStr,
-		NextScrape:   nextStr,
-		Proxies:      ps,
+		Total:           len(proxies),
+		PublicEndpoint:  s.getPublicEndpoint(),
+		LastScrape:      lastStr,
+		NextScrape:      nextStr,
+		ActiveOutbounds: outbounds,
+		Proxies:         ps,
 	}
 }
 
 func (s *StatusServer) handleAPI(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+	if !s.checkAuth(r) {
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"error":"unauthorized"}`))
+		return
+	}
 	json.NewEncoder(w).Encode(s.getStatusData())
 }
 
-func (s *StatusServer) handleRefresh(w http.ResponseWriter, r *http.Request) {
-	TriggerRefresh()
+func (s *StatusServer) handleAddRule(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+	if !s.checkAuth(r) {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	var req struct {
+		Name    string `json:"name"`
+		Domains string `json:"domains"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Name == "" || req.Domains == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"invalid parameters"}`))
+		return
+	}
+
+	parts := strings.Split(req.Domains, ",")
+	var cleanDomains []string
+	for _, d := range parts {
+		trimmed := strings.TrimSpace(d)
+		if trimmed != "" {
+			cleanDomains = append(cleanDomains, trimmed)
+		}
+	}
+
+	s.pool.ruleManager.Add(req.Name, cleanDomains)
+	w.Write([]byte(`{"status":"ok"}`))
+}
+
+func (s *StatusServer) handleDeleteRule(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if !s.checkAuth(r) {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Name == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	s.pool.ruleManager.Delete(req.Name)
+	w.Write([]byte(`{"status":"ok"}`))
+}
+
+func (s *StatusServer) handleRefresh(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if !s.checkAuth(r) {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+	TriggerRefresh()
 	w.Write([]byte(`{"status":"refresh triggered"}`))
 }
 
 func (s *StatusServer) handleSwitch(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+	if !s.checkAuth(r) {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	category := r.URL.Query().Get("category")
+	if category == "" {
+		category = "Default"
+	}
+
 	indexStr := r.URL.Query().Get("index")
 	if indexStr != "" {
 		index, err := strconv.Atoi(indexStr)
 		if err != nil {
 			w.WriteHeader(http.StatusBadRequest)
-			w.Write([]byte(`{"status":"invalid index"}`))
 			return
 		}
-		if _, ok := s.pool.SwitchTo(index); ok {
-			w.Write([]byte(`{"status":"ok"}`))
-		} else {
-			w.WriteHeader(http.StatusBadRequest)
-			w.Write([]byte(`{"status":"index out of range"}`))
-		}
+		s.pool.SwitchTo(category, index)
 	} else {
-		if _, ok := s.pool.SwitchNext(); ok {
-			w.Write([]byte(`{"status":"ok"}`))
-		} else {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			w.Write([]byte(`{"status":"no proxies available"}`))
-		}
+		s.pool.SwitchNextForCategory(category)
 	}
+	w.Write([]byte(`{"status":"ok"}`))
 }
 
 func (s *StatusServer) handleDashboard(w http.ResponseWriter, r *http.Request) {
-	data := s.getStatusData()
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	dashboardTmpl.Execute(w, data)
+	dashboardTmpl.Execute(w, nil)
 }
 
 var dashboardTmpl = template.Must(template.New("dashboard").Parse(`<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
-<title>SOCKS5 Pool Status</title>
+<title>Dashboard</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="refresh" content="30">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:system-ui,-apple-system,sans-serif;background:#0f172a;color:#e2e8f0;padding:12px}
-.container{max-width:800px;margin:0 auto}
-h1{font-size:1.3rem;color:#38bdf8}
-.current{background:#1e293b;border-radius:8px;padding:12px 16px;margin:12px 0;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px}
-.current-info{font-size:0.9rem}
-.current-info .addr{color:#4ade80;font-family:monospace;font-weight:bold}
-.current-info .region{color:#94a3b8;font-size:0.8rem}
-.badge{background:#065f46;color:#4ade80;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:bold}
-.time-info{background:#1e293b;border-radius:8px;padding:12px 16px;margin:8px 0;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px}
-.time-item{font-size:0.8rem;color:#94a3b8}
-.time-item span{color:#e2e8f0;font-family:monospace}
+.container{max-width:900px;margin:0 auto}
+.card{background:#1e293b;border-radius:8px;padding:12px 16px;margin:8px 0;border:1px solid #334155}
 .btn{background:#38bdf8;color:#0f172a;border:none;padding:6px 14px;border-radius:6px;cursor:pointer;font-weight:bold;font-size:0.8rem}
 .btn:hover{background:#7dd3fc}
-.btn:disabled{background:#334155;color:#64748b;cursor:not-allowed}
-.list{margin-top:12px}
-.proxy-card{background:#1e293b;border-radius:8px;padding:12px 16px;margin:6px 0;cursor:pointer;display:flex;justify-content:space-between;align-items:center;transition:background 0.15s;border:2px solid transparent}
-.proxy-card:hover{background:#334155}
-.proxy-card.active{border-color:#4ade80;background:#1a2e1a}
-.proxy-card .left{display:flex;align-items:center;gap:10px;min-width:0}
-.proxy-card .idx{color:#64748b;font-size:0.8rem;width:20px;text-align:center;flex-shrink:0}
-.proxy-card .addr{font-family:monospace;font-size:0.85rem;word-break:break-all}
-.proxy-card .loc{color:#94a3b8;font-size:0.8rem}
-.proxy-card .status{flex-shrink:0;font-size:0.75rem;font-weight:bold}
-.proxy-card .status.in-use{color:#4ade80}
-.proxy-card .status.standby{color:#64748b}
-.note{color:#64748b;font-size:0.75rem;margin-top:10px;text-align:center}
-.empty{text-align:center;padding:40px;color:#64748b}
-.total{color:#94a3b8;font-size:0.85rem}
-.gh-link{color:#64748b;text-decoration:none;display:inline-flex;align-items:center;gap:4px;font-size:0.8rem;transition:color 0.15s}
-.gh-link:hover{color:#e2e8f0}
-.gh-link svg{width:18px;height:18px;fill:currentColor}
+.btn-sm{padding:2px 8px;font-size:0.75rem;border-radius:4px;cursor:pointer}
+.btn-outline{background:transparent;border:1px solid #64748b;color:#94a3b8}
+.btn-outline:hover{background:#334155;color:#fff}
+.input-text{background:#0f172a;border:1px solid #475569;border-radius:6px;color:#fff;padding:6px 10px;font-size:0.85rem}
+.badge{padding:2px 6px;border-radius:4px;font-size:0.75rem;font-weight:bold}
+.tag{background:#334155;color:#94a3b8;font-size:0.75rem;padding:2px 6px;border-radius:4px}
+.tag-active{background:rgba(74,222,128,0.2);color:#4ade80;border:1px solid #4ade80}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin:10px 0}
+.rule-card{background:#1e293b;border:1px solid #334155;border-radius:8px;padding:10px;position:relative}
+.del-btn{position:absolute;right:6px;top:4px;background:transparent;border:none;color:#64748b;cursor:pointer;font-size:14px}
+.del-btn:hover{color:#f87171}
+.tab-bar{display:flex;gap:6px;overflow-x:auto;padding-bottom:6px;margin:10px 0}
+.tab-btn{background:transparent;border:1px solid #334155;color:#94a3b8;padding:4px 12px;border-radius:6px;font-size:0.8rem;cursor:pointer}
+.tab-btn.active{background:#38bdf8;color:#0f172a;border-color:#38bdf8;font-weight:bold}
+.proxy-item{background:#1e293b;border:1px solid #334155;border-radius:8px;padding:10px 14px;margin:6px 0;display:flex;justify-content:space-between;align-items:center}
 </style>
 </head>
 <body>
 <div class="container">
-<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
-  <h1>SOCKS5 Proxy Pool</h1>
-  <div style="display:flex;align-items:center;gap:12px">
-    <a class="gh-link" href="https://github.com/Dreamy-rain/socks5-proxy" target="_blank" rel="noopener"><svg viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg></a>
-    <span class="total">{{.Total}} proxies</span>
-  </div>
-</div>
-<div class="current">
-  <div class="current-info">
-    <span class="badge">IN USE</span>
-    <span class="addr">{{.ActiveProxy}}</span>
-    <span class="region">{{.ActiveRegion}}</span>
-  </div>
-</div>
-<div class="time-info">
-  <div>
-    <div class="time-item">Last: <span>{{if .LastScrape}}{{.LastScrape}}{{else}}N/A{{end}}</span></div>
-    <div class="time-item">Next: <span>{{if .NextScrape}}{{.NextScrape}}{{else}}N/A{{end}}</span></div>
-  </div>
-  <button class="btn" onclick="doRefresh(this)">Refresh Pool</button>
-</div>
-{{if .Proxies}}
-<div class="list">
-{{range $i, $p := .Proxies}}
-<div class="proxy-card{{if $p.Active}} active{{end}}" onclick="doSwitch({{$i}},this)">
-  <div class="left">
-    <span class="idx">{{$i}}</span>
-    <div>
-      <div class="addr">{{$p.Addr}}</div>
-      <div class="loc">{{$p.Country}}{{if $p.City}}, {{$p.City}}{{end}}</div>
+
+  <!-- 极简匿名化登录卡片：防扫描特征识别 -->
+  <div id="login-box" style="display:flex;justify-content:center;align-items:center;min-height:70vh">
+    <div style="background:#1e293b;border:1px solid #334155;border-radius:8px;padding:20px;width:100%;max-width:300px;text-align:center">
+      <div style="margin-bottom:12px">
+        <input id="pwd-input" type="password" class="input-text" placeholder="Password" style="width:100%" onkeydown="if(event.key==='Enter')login()" />
+      </div>
+      <div id="login-err" style="display:none;color:#f87171;font-size:0.75rem;margin-bottom:8px">Invalid password</div>
+      <button class="btn" style="width:100%" onclick="login()">进入</button>
     </div>
   </div>
-  <span class="status {{if $p.Active}}in-use{{else}}standby{{end}}">{{if $p.Active}}IN USE{{else}}standby{{end}}</span>
+
+  <!-- 管理主面板 -->
+  <div id="main-panel" style="display:none">
+    <div style="display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid #334155">
+      <div>
+        <h2 style="font-size:1.1rem;color:#38bdf8;display:flex;align-items:center;gap:6px">
+          SOCKS5 智能分流代理池
+          <span style="font-size:0.75rem;background:rgba(74,222,128,0.2);color:#4ade80;border:1px solid #4ade80;padding:1px 6px;border-radius:4px">已认证</span>
+        </h2>
+        <div style="margin-top:4px;font-size:0.8rem;color:#94a3b8;display:flex;align-items:center;gap:6px">
+          <span>公网接入点:</span>
+          <span id="pub-endpoint" style="font-family:monospace;color:#38bdf8;background:#0f172a;padding:2px 6px;border-radius:4px">-</span>
+          <button class="btn-sm btn-outline" onclick="copyEndpoint()">复制</button>
+        </div>
+      </div>
+      <div style="display:flex;gap:8px">
+        <button class="btn-sm btn" onclick="toggleAddRule()">+ 添加规则</button>
+        <button class="btn-sm btn-outline" onclick="refreshPool()">刷新池</button>
+        <button class="btn-sm btn-outline" onclick="logout()">退出</button>
+      </div>
+    </div>
+
+    <!-- 内联添加规则表单 -->
+    <div id="add-rule-form" style="display:none;background:#1e293b;border:1px solid #38bdf8;border-radius:8px;padding:12px;margin:10px 0">
+      <div style="font-size:0.85rem;color:#38bdf8;font-weight:bold;margin-bottom:8px">添加自定义分流规则</div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <input id="new-rule-name" class="input-text" style="flex:1;min-width:120px" placeholder="规则名称 (如 abc)" />
+        <input id="new-rule-domains" class="input-text" style="flex:2;min-width:200px" placeholder="匹配域名 (多个逗号隔开，如 abc.com,api.abc.com)" />
+        <button class="btn" onclick="saveNewRule()">保存</button>
+        <button class="btn-outline" style="padding:6px 10px;border-radius:6px;cursor:pointer" onclick="toggleAddRule()">取消</button>
+      </div>
+    </div>
+
+    <div style="margin-top:14px">
+      <div style="font-size:0.8rem;color:#94a3b8;font-weight:bold;text-transform:uppercase">各规则当前出口 (Active Outbounds)</div>
+      <div id="rules-container" class="grid"></div>
+    </div>
+
+    <div class="tab-bar" id="tabs-container"></div>
+    <div id="proxies-container"></div>
+  </div>
+
 </div>
-{{end}}
-</div>
-{{else}}
-<p class="empty">No proxies available. Waiting for next scrape cycle...</p>
-{{end}}
-<p class="note">Auto-refresh 30s | Beijing Time (UTC+8) | Click proxy to switch | Google-verified</p>
-<p class="note">Proxy source: <a href="https://socks5-proxy.github.io/" target="_blank" rel="noopener" style="color:#38bdf8;text-decoration:none">socks5-proxy.github.io</a></p>
-</div>
+
 <script>
-function doSwitch(idx, el) {
-  if (el.classList.contains('active')) return;
-  el.style.opacity='0.5';
-  fetch('/api/switch?index='+idx).then(function(res) {
-    if (res.ok) { location.reload(); }
-    else { el.style.opacity='1'; alert('Switch failed'); }
-  }).catch(function() { el.style.opacity='1'; });
+let token = localStorage.getItem("admin_token") || "";
+let cachedData = null;
+let currentTab = "all";
+
+function getHeaders() {
+  return { "Authorization": "Bearer " + token, "Content-Type": "application/json" };
 }
-function doRefresh(btn) {
-  btn.disabled = true;
-  btn.textContent = 'Refreshing...';
-  fetch('/api/refresh').then(function() {
-    setTimeout(function() { location.reload(); }, 15000);
-  }).catch(function() {
-    btn.disabled = false;
-    btn.textContent = 'Refresh Pool';
+
+function login() {
+  const p = document.getElementById("pwd-input").value;
+  fetch("/api/auth", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ password: p })
+  }).then(res => {
+    if (res.ok) {
+      token = p;
+      localStorage.setItem("admin_token", token);
+      document.getElementById("login-box").style.display = "none";
+      document.getElementById("main-panel").style.display = "block";
+      loadStatus();
+    } else {
+      document.getElementById("login-err").style.display = "block";
+    }
+  }).catch(() => {
+    document.getElementById("login-err").style.display = "block";
   });
+}
+
+function logout() {
+  localStorage.removeItem("admin_token");
+  token = "";
+  document.getElementById("main-panel").style.display = "none";
+  document.getElementById("login-box").style.display = "flex";
+}
+
+function copyEndpoint() {
+  const text = document.getElementById("pub-endpoint").textContent;
+  navigator.clipboard.writeText(text).then(() => { alert("已复制接入点: " + text); });
+}
+
+function loadStatus() {
+  fetch("/api/status", { headers: getHeaders() })
+    .then(r => {
+      if (r.status === 401) { logout(); return; }
+      return r.json();
+    })
+    .then(data => {
+      if (!data) return;
+      cachedData = data;
+      renderAll();
+    });
+}
+
+function renderAll() {
+  if (!cachedData) return;
+  document.getElementById("pub-endpoint").textContent = cachedData.public_endpoint;
+
+  // 渲染规则卡片
+  const rBox = document.getElementById("rules-container");
+  rBox.innerHTML = (cachedData.active_outbounds || []).map(r => `
+    <div class="rule-card">
+      <button class="del-btn" onclick="delRule('${r.name}')" title="删除规则">×</button>
+      <div style="font-size:0.85rem;font-weight:bold;color:#38bdf8">${r.name} <span style="font-size:0.75rem;color:#94a3b8">(${r.count})</span></div>
+      <div style="font-family:monospace;font-size:0.8rem;color:#4ade80;margin:4px 0">${r.active_ip}</div>
+      <div style="font-size:0.75rem;color:#94a3b8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${r.location}">${r.location}</div>
+    </div>
+  `).join("");
+
+  // 渲染 Tabs
+  const tBox = document.getElementById("tabs-container");
+  let tabsHtml = `<button class="tab-btn ${currentTab==='all'?'active':''}" onclick="setTab('all')">全部 (${cachedData.total})</button>`;
+  (cachedData.active_outbounds || []).forEach(r => {
+    tabsHtml += `<button class="tab-btn ${currentTab===r.name?'active':''}" onclick="setTab('${r.name}')">${r.name} (${r.count})</button>`;
+  });
+  tBox.innerHTML = tabsHtml;
+
+  // 渲染节点列表
+  const pBox = document.getElementById("proxies-container");
+  const filtered = (cachedData.proxies || []).filter(p => currentTab === 'all' || (p.tags && p.tags.includes(currentTab)));
+  
+  if (filtered.length === 0) {
+    pBox.innerHTML = `<div style="text-align:center;padding:30px;color:#64748b">暂无满足该条件的节点</div>`;
+    return;
+  }
+
+  pBox.innerHTML = filtered.map(p => `
+    <div class="proxy-item">
+      <div>
+        <div style="display:flex;align-items:center;gap:6px">
+          <span style="font-family:monospace;font-size:0.85rem;font-weight:bold">${p.addr}</span>
+          ${p.active ? `<span class="tag tag-active">ACTIVE: ${p.active}</span>` : '<span class="tag">STANDBY</span>'}
+        </div>
+        <div style="font-size:0.75rem;color:#94a3b8;margin-top:2px">${p.country} · ${p.city}</div>
+      </div>
+      <div style="display:flex;gap:4px;flex-wrap:wrap">
+        ${(p.tags || []).map(t => `<span class="tag">${t}</span>`).join("")}
+      </div>
+    </div>
+  `).join("");
+}
+
+function setTab(t) {
+  currentTab = t;
+  renderAll();
+}
+
+function toggleAddRule() {
+  const f = document.getElementById("add-rule-form");
+  f.style.display = f.style.display === "none" ? "block" : "none";
+}
+
+function saveNewRule() {
+  const name = document.getElementById("new-rule-name").value.trim();
+  const domains = document.getElementById("new-rule-domains").value.trim();
+  if (!name || !domains) { alert("请填写名称和域名"); return; }
+
+  fetch("/api/rules/add", {
+    method: "POST",
+    headers: getHeaders(),
+    body: JSON.stringify({ name: name, domains: domains })
+  }).then(r => r.json()).then(() => {
+    document.getElementById("new-rule-name").value = "";
+    document.getElementById("new-rule-domains").value = "";
+    toggleAddRule();
+    loadStatus();
+  });
+}
+
+function delRule(name) {
+  if (!confirm("确定删除分流规则 " + name + " 吗?")) return;
+  fetch("/api/rules/delete", {
+    method: "POST",
+    headers: getHeaders(),
+    body: JSON.stringify({ name: name })
+  }).then(r => r.json()).then(() => {
+    if (currentTab === name) currentTab = "all";
+    loadStatus();
+  });
+}
+
+function refreshPool() {
+  fetch("/api/refresh", { method: "POST", headers: getHeaders() })
+    .then(() => { alert("已触发重新抓取测活！"); });
+}
+
+// 自动检测登录态
+if (token) {
+  document.getElementById("login-box").style.display = "none";
+  document.getElementById("main-panel").style.display = "block";
+  loadStatus();
+  setInterval(loadStatus, 15000);
 }
 </script>
 </body>

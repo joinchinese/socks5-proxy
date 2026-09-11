@@ -16,10 +16,11 @@ var (
 )
 
 type Proxy struct {
-	IP      string
-	Port    string
-	Country string
-	City    string
+	IP      string   `json:"ip"`
+	Port    string   `json:"port"`
+	Country string   `json:"country"`
+	City    string   `json:"city"`
+	Tags    []string `json:"tags"`
 }
 
 func (p Proxy) Addr() string {

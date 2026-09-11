@@ -14,45 +14,12 @@ import (
 	"time"
 )
 
-// Blocked countries: China mainland + Hong Kong (can't access Google/AI)
 var blockedCountries = map[string]bool{
 	"china":     true,
 	"hong kong": true,
 }
 
-// AI 目标检查定义
-type AITarget struct {
-	Name     string
-	URL      string
-	Validate func(statusCode int) bool
-}
-
-var aiTargets = []AITarget{
-	{
-		Name: "OpenAI",
-		URL:  "https://api.openai.com/v1/models",
-		// 未授权会返回 401 说明成功到达网关且未被 Cloudflare WAF 盾拦截
-		Validate: func(code int) bool { return code == http.StatusUnauthorized || code == http.StatusOK },
-	},
-	{
-		Name: "Anthropic",
-		URL:  "https://api.anthropic.com/v1/models",
-		Validate: func(code int) bool { return code == http.StatusUnauthorized || code == http.StatusOK },
-	},
-	{
-		Name: "Gemini",
-		URL:  "https://generativelanguage.googleapis.com/$discovery/rest?version=v1beta",
-		// 公开 Discovery 接口，正常直接返回 200 OK
-		Validate: func(code int) bool { return code == http.StatusOK },
-	},
-	{
-		Name: "Grok",
-		URL:  "https://api.x.ai/v1/models",
-		Validate: func(code int) bool { return code == http.StatusUnauthorized || code == http.StatusOK },
-	},
-}
-
-// CheckProxies concurrently checks a list of proxies.
+// CheckProxies 并发检测代理节点并根据当前规则动态打标
 func CheckProxies(proxies []Proxy, timeout time.Duration, maxConcurrent int, pool *ProxyPool) []Proxy {
 	var (
 		mu    sync.Mutex
@@ -60,6 +27,12 @@ func CheckProxies(proxies []Proxy, timeout time.Duration, maxConcurrent int, poo
 		wg    sync.WaitGroup
 		sem   = make(chan struct{}, maxConcurrent)
 	)
+
+	// 获取当前所有规则用于打标探测
+	var currentRules []RouteRule
+	if pool != nil && pool.ruleManager != nil {
+		currentRules = pool.ruleManager.All()
+	}
 
 	for _, p := range proxies {
 		wg.Add(1)
@@ -74,26 +47,24 @@ func CheckProxies(proxies []Proxy, timeout time.Duration, maxConcurrent int, poo
 			px.City = strings.TrimSpace(city)
 
 			if blockedCountries[strings.ToLower(px.Country)] {
-				log.Printf("[checker] %s skipped (%s)", px.Addr(), px.Country)
 				return
 			}
 
-			// 2. 基础出口连通性（极速过滤死节点，不浪费时间）
+			// 2. 基础出口极速初筛
 			if !checkGoogle(px, timeout) {
 				return
 			}
 
-			// 3. AI 核心质量检测（必须通过 OpenAI、Anthropic、Gemini、Grok 中至少 2 项）
-			passedAIs := checkAIQuality(px, timeout)
-			if len(passedAIs) < 2 {
-				log.Printf("[checker] %s skipped (基础通但 AI 质量不足: 仅通过 %v)", px.Addr(), passedAIs)
-				return
+			// 3. 针对所有规则动态测活打标
+			passedTags := checkRules(px, currentRules, timeout)
+			if len(passedTags) == 0 {
+				return // 无任何一项规则通过，判定为死节点
 			}
 
-			// 通过检测，打印成功日志
-			log.Printf("[checker] %s OK (%s %s) [AI通过: %s]", px.Addr(), px.Country, px.City, strings.Join(passedAIs, ", "))
+			px.Tags = passedTags
+			log.Printf("[checker] %s OK (%s %s) [支持规则: %s]", px.Addr(), px.Country, px.City, strings.Join(passedTags, ", "))
 
-			// 实时上屏入池
+			// 4. 实时推入全局代理池，秒级生效
 			if pool != nil {
 				pool.Add(px)
 			}
@@ -105,22 +76,21 @@ func CheckProxies(proxies []Proxy, timeout time.Duration, maxConcurrent int, poo
 	}
 
 	wg.Wait()
-	log.Printf("[checker] %d/%d proxies alive (Google-verified, non-CN/HK, AI >= 2)", len(alive), len(proxies))
+	log.Printf("[checker] %d/%d 个节点验证合格入池", len(alive), len(proxies))
 	return alive
 }
 
-// checkAIQuality 并发检测 4 大模型端点，返回测试通过的 AI 名称列表
-func checkAIQuality(p Proxy, timeout time.Duration) []string {
+// checkRules 根据当前规则列表，并发检测该节点支持哪些规则
+func checkRules(p Proxy, rules []RouteRule, timeout time.Duration) []string {
 	proxyURL, err := url.Parse(fmt.Sprintf("socks5://%s", p.Addr()))
 	if err != nil {
 		return nil
 	}
 
-	// 使用标准库的 SOCKS5 HTTP Client，强制严格校验证书（防中间人过期假证书/劫持）
 	transport := &http.Transport{
 		Proxy: http.ProxyURL(proxyURL),
 		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: false, // 严格验证证书合法性与有效期
+			InsecureSkipVerify: false, // 严格校验证书
 		},
 		DialContext: (&net.Dialer{
 			Timeout: timeout,
@@ -135,47 +105,81 @@ func checkAIQuality(p Proxy, timeout time.Duration) []string {
 	}
 
 	var (
-		mu     sync.Mutex
-		passed []string
-		wg     sync.WaitGroup
+		mu         sync.Mutex
+		passedTags []string
+		wg         sync.WaitGroup
 	)
 
-	for _, target := range aiTargets {
+	for _, rule := range rules {
 		wg.Add(1)
-		go func(t AITarget) {
+		go func(r RouteRule) {
 			defer wg.Done()
 
-			ctx, cancel := context.WithTimeout(context.Background(), timeout)
-			defer cancel()
-
-			req, err := http.NewRequestWithContext(ctx, "GET", t.URL, nil)
-			if err != nil {
-				return
-			}
-			// 设置现代浏览器 User-Agent，避免被云厂商 Cloudflare 盾直接拒绝
-			req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
-			req.Header.Set("Accept", "*/*")
-
-			resp, err := client.Do(req)
-			if err != nil {
-				return // 握手失败、证书过期、connection reset 均直接返回
-			}
-			defer resp.Body.Close()
-			io.Copy(io.Discard, resp.Body)
-
-			if t.Validate(resp.StatusCode) {
+			if testSingleRule(client, r, timeout) {
 				mu.Lock()
-				passed = append(passed, t.Name)
+				passedTags = append(passedTags, r.Name)
 				mu.Unlock()
 			}
-		}(target)
+		}(rule)
 	}
 
 	wg.Wait()
-	return passed
+	return passedTags
 }
 
-// checkGoogle 连接 Google 204 端点进行极速基础测活
+// testSingleRule 测试节点是否满足某一条规则
+func testSingleRule(client *http.Client, rule RouteRule, timeout time.Duration) bool {
+	lowerName := strings.ToLower(rule.Name)
+
+	var testURL string
+	var validate func(code int) bool
+
+	switch lowerName {
+	case "openai":
+		testURL = "https://api.openai.com/v1/models"
+		validate = func(code int) bool { return code == http.StatusUnauthorized || code == http.StatusOK }
+	case "anthropic", "claude":
+		testURL = "https://api.anthropic.com/v1/models"
+		validate = func(code int) bool { return code == http.StatusUnauthorized || code == http.StatusOK }
+	case "gemini":
+		testURL = "https://generativelanguage.googleapis.com/$discovery/rest?version=v1beta"
+		validate = func(code int) bool { return code == http.StatusOK }
+	case "grok":
+		testURL = "https://api.x.ai/v1/models"
+		validate = func(code int) bool { return code == http.StatusUnauthorized || code == http.StatusOK }
+	default:
+		// 用户自定义规则：取第一个域名进行 HTTPS 连通性测试
+		if len(rule.Domains) == 0 {
+			return false
+		}
+		targetDomain := strings.TrimSpace(rule.Domains[0])
+		if !strings.HasPrefix(targetDomain, "http://") && !strings.HasPrefix(targetDomain, "https://") {
+			testURL = "https://" + targetDomain
+		} else {
+			testURL = targetDomain
+		}
+		validate = func(code int) bool { return code > 0 && code < 500 } // 只要有有效 HTTP/HTTPS 响应即通过
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", testURL, nil)
+	if err != nil {
+		return false
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+
+	return validate(resp.StatusCode)
+}
+
 func checkGoogle(p Proxy, timeout time.Duration) bool {
 	conn, err := net.DialTimeout("tcp", p.Addr(), timeout)
 	if err != nil {
@@ -184,7 +188,6 @@ func checkGoogle(p Proxy, timeout time.Duration) bool {
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(timeout))
 
-	// SOCKS5 greeting
 	if _, err := conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
 		return false
 	}
@@ -193,11 +196,10 @@ func checkGoogle(p Proxy, timeout time.Duration) bool {
 		return false
 	}
 
-	// Connect to www.google.com:80 through proxy
 	target := "www.google.com"
 	req := []byte{0x05, 0x01, 0x00, 0x03, byte(len(target))}
 	req = append(req, []byte(target)...)
-	req = append(req, 0x00, 0x50) // port 80
+	req = append(req, 0x00, 0x50)
 
 	if _, err := conn.Write(req); err != nil {
 		return false
@@ -209,7 +211,6 @@ func checkGoogle(p Proxy, timeout time.Duration) bool {
 		return false
 	}
 
-	// Send HTTP request to Google's generate_204 endpoint
 	httpReq := "GET /generate_204 HTTP/1.1\r\nHost: www.google.com\r\nConnection: close\r\n\r\n"
 	if _, err := conn.Write([]byte(httpReq)); err != nil {
 		return false
@@ -224,7 +225,6 @@ func checkGoogle(p Proxy, timeout time.Duration) bool {
 	return string(respBuf[:4]) == "HTTP"
 }
 
-// LookupGeo 查询 ip-api.com 获取国家归属地
 func LookupGeo(ip string, timeout time.Duration) (country, city string) {
 	conn, err := net.DialTimeout("tcp", "ip-api.com:80", timeout)
 	if err != nil {

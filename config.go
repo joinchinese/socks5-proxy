@@ -15,6 +15,7 @@ type Config struct {
 	MaxConcurrent  int
 	AuthUser       string // 认证用户名
 	AuthPass       string // 认证密码
+	AdminPass      string // Web UI 管理密码
 }
 
 func ParseConfig() *Config {
@@ -27,6 +28,7 @@ func ParseConfig() *Config {
 	flag.IntVar(&cfg.MaxConcurrent, "max-concurrent", 5, "max concurrent health checks")
 	flag.StringVar(&cfg.AuthUser, "user", "admin123", "SOCKS5 authentication username")
 	flag.StringVar(&cfg.AuthPass, "pass", "admin123", "SOCKS5 authentication password")
+	flag.StringVar(&cfg.AdminPass, "admin-pass", "", "Web UI admin password (defaults to -pass)")
 	flag.Parse()
 
 	// 自动读取环境变量（优先使用环境变量中的账密与端口）
@@ -35,6 +37,12 @@ func ParseConfig() *Config {
 	}
 	if p := os.Getenv("AUTH_PASS"); p != "" {
 		cfg.AuthPass = p
+	}
+	if ap := os.Getenv("ADMIN_PASS"); ap != "" {
+		cfg.AdminPass = ap
+	}
+	if cfg.AdminPass == "" {
+		cfg.AdminPass = cfg.AuthPass
 	}
 
 	// 自动适配容器分配的公网端口
