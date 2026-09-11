@@ -129,6 +129,7 @@ func (s *StatusServer) Start(addr string) error {
 	mux.HandleFunc("/api/refresh", s.handleRefresh)
 	mux.HandleFunc("/api/switch", s.handleSwitch)
 	mux.HandleFunc("/api/rules/add", s.handleAddRule)
+	mux.HandleFunc("/api/rules/update", s.handleUpdateRule)
 	mux.HandleFunc("/api/rules/delete", s.handleDeleteRule)
 	return http.ListenAndServe(addr, mux)
 }
@@ -267,6 +268,48 @@ func (s *StatusServer) handleAddRule(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(`{"status":"ok"}`))
 }
 
+func (s *StatusServer) handleUpdateRule(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if !s.checkAuth(r) {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	var req struct {
+		OldName string `json:"old_name"`
+		Name    string `json:"name"`
+		Domains string `json:"domains"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.OldName == "" || req.Name == "" || req.Domains == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"invalid parameters"}`))
+		return
+	}
+
+	parts := strings.Split(req.Domains, ",")
+	var cleanDomains []string
+	for _, d := range parts {
+		trimmed := strings.TrimSpace(d)
+		if trimmed != "" {
+			cleanDomains = append(cleanDomains, trimmed)
+		}
+	}
+
+	rule, ok := s.pool.ruleManager.Update(req.OldName, req.Name, cleanDomains)
+	if !ok {
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte(`{"error":"rule not found"}`))
+		return
+	}
+
+	if !strings.EqualFold(req.OldName, req.Name) {
+		s.pool.RenameTag(req.OldName, req.Name)
+	}
+
+	go s.pool.TestAndAddRuleToAlive(rule, 3*time.Second)
+	w.Write([]byte(`{"status":"ok"}`))
+}
+
 func (s *StatusServer) handleDeleteRule(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	if !s.checkAuth(r) {
@@ -348,8 +391,11 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#0f172a;color:#e2
 .tag-active{background:rgba(74,222,128,0.2);color:#4ade80;border:1px solid #4ade80}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin:10px 0}
 .rule-card{background:#1e293b;border:1px solid #334155;border-radius:8px;padding:10px;position:relative}
-.del-btn{position:absolute;right:6px;top:4px;background:transparent;border:none;color:#64748b;cursor:pointer;font-size:14px}
-.del-btn:hover{color:#f87171}
+.card-actions{position:absolute;right:6px;top:4px;display:flex;gap:3px;align-items:center}
+.action-btn{background:transparent;border:none;color:#94a3b8;cursor:pointer;font-size:12px;padding:2px 5px;border-radius:4px;line-height:1}
+.action-btn:hover{color:#38bdf8;background:#334155}
+.action-btn.del:hover{color:#f87171;background:rgba(239,68,68,0.2)}
+.del-popover{position:absolute;right:0;top:26px;background:#0f172a;border:1px solid #ef4444;border-radius:6px;padding:8px 10px;z-index:50;box-shadow:0 4px 16px rgba(0,0,0,0.8);width:165px;text-align:left}
 .tab-bar{display:flex;gap:6px;overflow-x:auto;padding-bottom:6px;margin:10px 0}
 .tab-btn{background:transparent;border:1px solid #334155;color:#94a3b8;padding:4px 12px;border-radius:6px;font-size:0.8rem;cursor:pointer}
 .tab-btn.active{background:#38bdf8;color:#0f172a;border-color:#38bdf8;font-weight:bold}
@@ -398,6 +444,18 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#0f172a;color:#e2
         <input id="new-rule-domains" class="input-text" style="flex:2;min-width:200px" placeholder="匹配域名 (多个逗号隔开，如 abc.com,api.abc.com)" />
         <button class="btn" onclick="saveNewRule()">保存</button>
         <button class="btn-outline" style="padding:6px 10px;border-radius:6px;cursor:pointer" onclick="toggleAddRule()">取消</button>
+      </div>
+    </div>
+
+    <!-- 内联编辑规则表单 -->
+    <div id="edit-rule-form" style="display:none;background:#1e293b;border:1px solid #38bdf8;border-radius:8px;padding:12px;margin:10px 0">
+      <div style="font-size:0.85rem;color:#38bdf8;font-weight:bold;margin-bottom:8px">编辑分流规则</div>
+      <input type="hidden" id="edit-rule-old-name" />
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <input id="edit-rule-name" class="input-text" style="flex:1;min-width:120px" placeholder="规则名称" />
+        <input id="edit-rule-domains" class="input-text" style="flex:2;min-width:200px" placeholder="匹配域名 (多个逗号隔开)" />
+        <button class="btn" onclick="saveEditRule()">保存修改</button>
+        <button class="btn-outline" style="padding:6px 10px;border-radius:6px;cursor:pointer" onclick="closeEditRule()">取消</button>
       </div>
     </div>
 
@@ -477,10 +535,20 @@ function renderAll() {
   for (var i = 0; i < outbounds.length; i++) {
     var r = outbounds[i];
     rulesHtml += '<div class="rule-card">' +
-      '<button class="del-btn" onclick="delRule(\'' + r.name + '\')" title="删除规则">&times;</button>' +
-      '<div style="font-size:0.85rem;font-weight:bold;color:#38bdf8">' + r.name + ' <span style="font-size:0.75rem;color:#94a3b8">(' + r.count + ')</span></div>' +
+      '<div class="card-actions">' +
+      '<button class="action-btn" onclick="openEditRuleBtn(this)" data-name="' + r.name + '" data-domains="' + r.domains + '" title="编辑规则">&#9998;</button>' +
+      '<button class="action-btn del" onclick="askDeleteRule(\'' + r.name + '\', event)" title="删除规则">&times;</button>' +
+      '</div>' +
+      '<div id="del-pop-' + r.name + '" class="del-popover" style="display:none">' +
+      '<div style="font-size:0.75rem;color:#fca5a5;margin-bottom:6px">确认删除规则 ' + r.name + '？</div>' +
+      '<div style="display:flex;gap:6px;justify-content:flex-end">' +
+      '<button class="btn-sm" style="background:#ef4444;color:#fff;border:none" onclick="confirmDelete(\'' + r.name + '\')">确认</button>' +
+      '<button class="btn-sm btn-outline" onclick="closeDelPop(\'' + r.name + '\')">取消</button>' +
+      '</div>' +
+      '</div>' +
+      '<div style="font-size:0.85rem;font-weight:bold;color:#38bdf8;padding-right:42px">' + r.name + ' <span style="font-size:0.75rem;color:#94a3b8">(' + r.count + ')</span></div>' +
       '<div style="font-family:monospace;font-size:0.8rem;color:#4ade80;margin:4px 0">' + r.active_ip + '</div>' +
-      '<div style="font-size:0.75rem;color:#94a3b8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="' + r.location + '">' + r.location + '</div>' +
+      '<div style="font-size:0.75rem;color:#94a3b8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="' + r.domains + '">' + r.location + '</div>' +
       '</div>';
   }
   rBox.innerHTML = rulesHtml;
@@ -542,6 +610,7 @@ function setTab(t) {
 }
 
 function toggleAddRule() {
+  document.getElementById("edit-rule-form").style.display = "none";
   var f = document.getElementById("add-rule-form");
   f.style.display = f.style.display === "none" ? "block" : "none";
 }
@@ -560,14 +629,60 @@ function saveNewRule() {
     document.getElementById("new-rule-domains").value = "";
     toggleAddRule();
     loadStatus();
-    // 后台探测通常在 1~3 秒内完成，自动延时刷新展现新标签
     setTimeout(loadStatus, 1500);
     setTimeout(loadStatus, 3500);
   });
 }
 
-function delRule(name) {
-  if (!confirm("确定删除分流规则 " + name + " 吗?")) return;
+function openEditRuleBtn(btn) {
+  document.getElementById("add-rule-form").style.display = "none";
+  var name = btn.getAttribute("data-name");
+  var domains = btn.getAttribute("data-domains");
+  document.getElementById("edit-rule-old-name").value = name;
+  document.getElementById("edit-rule-name").value = name;
+  document.getElementById("edit-rule-domains").value = domains;
+  var f = document.getElementById("edit-rule-form");
+  f.style.display = "block";
+  f.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function closeEditRule() {
+  document.getElementById("edit-rule-form").style.display = "none";
+}
+
+function saveEditRule() {
+  var oldName = document.getElementById("edit-rule-old-name").value.trim();
+  var name = document.getElementById("edit-rule-name").value.trim();
+  var domains = document.getElementById("edit-rule-domains").value.trim();
+  if (!name || !domains) { alert("请填写名称和域名"); return; }
+
+  fetch("/api/rules/update", {
+    method: "POST",
+    headers: getHeaders(),
+    body: JSON.stringify({ old_name: oldName, name: name, domains: domains })
+  }).then(function(r) { return r.json(); }).then(function() {
+    closeEditRule();
+    loadStatus();
+    setTimeout(loadStatus, 1500);
+    setTimeout(loadStatus, 3500);
+  });
+}
+
+function askDeleteRule(name, event) {
+  if (event) event.stopPropagation();
+  var allPops = document.querySelectorAll(".del-popover");
+  for (var i = 0; i < allPops.length; i++) { allPops[i].style.display = "none"; }
+  var pop = document.getElementById("del-pop-" + name);
+  if (pop) { pop.style.display = "block"; }
+}
+
+function closeDelPop(name) {
+  var pop = document.getElementById("del-pop-" + name);
+  if (pop) { pop.style.display = "none"; }
+}
+
+function confirmDelete(name) {
+  closeDelPop(name);
   fetch("/api/rules/delete", {
     method: "POST",
     headers: getHeaders(),
@@ -577,6 +692,13 @@ function delRule(name) {
     loadStatus();
   });
 }
+
+document.addEventListener("click", function(e) {
+  if (!e.target.closest(".del-popover") && !e.target.closest(".action-btn.del")) {
+    var allPops = document.querySelectorAll(".del-popover");
+    for (var i = 0; i < allPops.length; i++) { allPops[i].style.display = "none"; }
+  }
+});
 
 function refreshPool() {
   fetch("/api/refresh", { method: "POST", headers: getHeaders() })

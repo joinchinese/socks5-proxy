@@ -315,6 +315,20 @@ func (p *ProxyPool) AddTagToProxy(addr string, tag string) {
 	}
 }
 
+// RenameTag 重命名节点标签
+func (p *ProxyPool) RenameTag(oldTag, newTag string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	for i, px := range p.proxies {
+		for j, t := range px.Tags {
+			if strings.EqualFold(t, oldTag) {
+				p.proxies[i].Tags[j] = newTag
+			}
+		}
+	}
+}
+
 // RemoveTagFromAllProxies 当规则被删除时，从所有节点中清理该标签
 func (p *ProxyPool) RemoveTagFromAllProxies(tag string) {
 	p.mu.Lock()

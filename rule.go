@@ -115,6 +115,25 @@ func (rm *RuleManager) Add(name string, domains []string) RouteRule {
 	return rule
 }
 
+func (rm *RuleManager) Update(oldName, newName string, domains []string) (RouteRule, bool) {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+
+	oldName = strings.TrimSpace(oldName)
+	newName = strings.TrimSpace(newName)
+	for i, r := range rm.rules {
+		if strings.EqualFold(r.Name, oldName) {
+			rm.rules[i].Name = newName
+			rm.rules[i].Domains = domains
+			rm.rules[i].ID = "rule_" + strings.ToLower(newName)
+			rm.saveLocked()
+			log.Printf("[rule] 更新规则: %s -> %s %v", oldName, newName, domains)
+			return rm.rules[i], true
+		}
+	}
+	return RouteRule{}, false
+}
+
 func (rm *RuleManager) Delete(name string) bool {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
